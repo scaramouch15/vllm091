@@ -73,6 +73,7 @@ from benchmark_dataset import (
     VisionArenaDataset,
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+from mixed_workload_dataset import add_mixed_dataset_args, mixed_dataset_from_args
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -601,6 +602,11 @@ def save_to_pytorch_benchmark_format(
 
 def main(args: argparse.Namespace):
     print(args)
+    if getattr(args, "mixed_dry_run", False) and args.dataset_name != "mixed":
+        raise ValueError("--mixed-dry-run requires --dataset-name mixed")
+    mixed_dataset = (
+        mixed_dataset_from_args(args) if args.dataset_name == "mixed" else None
+    )
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -617,10 +623,20 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
 
+    tokenizer_kwargs = {}
+    if args.dataset_name == "mixed" and args.mixed_dry_run:
+        tokenizer_id = os.path.abspath(os.path.expanduser(tokenizer_id))
+        if not os.path.isdir(tokenizer_id):
+            raise ValueError(
+                "mixed dry-run requires a local --tokenizer directory "
+                "(or a local --model directory); no tokenizer download is performed"
+            )
+        tokenizer_kwargs["local_files_only"] = True
     tokenizer = get_tokenizer(
         tokenizer_id,
         tokenizer_mode=tokenizer_mode,
         trust_remote_code=args.trust_remote_code,
+        **tokenizer_kwargs,
     )
 
     if args.dataset_name is None:
@@ -629,7 +645,19 @@ def main(args: argparse.Namespace):
             "'--dataset-path' if required."
         )
 
-    if args.dataset_name == "custom":
+    if args.dataset_name == "mixed":
+        input_requests = mixed_dataset.sample(tokenizer, args.num_prompts)
+        if args.mixed_export_path:
+            mixed_dataset.export(
+                args.mixed_export_path,
+                tokenizer_id=str(tokenizer_id),
+                tokenizer_mode=tokenizer_mode,
+            )
+        if args.mixed_dry_run:
+            mixed_dataset.print_inspection()
+            return
+
+    elif args.dataset_name == "custom":
         dataset = CustomDataset(dataset_path=args.dataset_path)
         input_requests = dataset.sample(
             num_requests=args.num_prompts,
@@ -773,6 +801,11 @@ def main(args: argparse.Namespace):
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
 
+    if args.dataset_name == "mixed":
+        # Already rendered by the tokenizer's chat template. The existing body
+        # path covers both the initial probe and all subsequent requests.
+        sampling_params["add_special_tokens"] = False
+
     if args.backend == "llama.cpp":
         # Disable prompt caching in llama.cpp backend
         sampling_params["cache_prompt"] = False
@@ -904,7 +937,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom"],
+        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf", "custom", "mixed"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
@@ -1225,6 +1258,7 @@ if __name__ == "__main__":
         "script chooses a LoRA module at random.",
     )
 
+    add_mixed_dataset_args(parser)
     args = parser.parse_args()
 
     main(args)
