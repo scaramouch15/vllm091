@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import random
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -225,17 +226,12 @@ class MixedWorkloadDataset(BenchmarkDataset):
         return None
 
     @staticmethod
-    def _duplicate(seen, digest: str, task: str, location: str) -> bool:
-        previous = seen.get(digest)
-        if previous is None:
-            return False
-        previous_task, previous_location = previous
-        if previous_task != task:
-            raise ValueError(
-                f"mixed input/type conflict: {previous_task} at "
-                f"{previous_location} and {task} at {location}"
-            )
-        return True
+    def _duplicate(seen, digest: str, task: str) -> bool:
+        # Keep all source types as a bit mask, even for within-type duplicates.
+        task_bit = 1 << TASKS.index(task)
+        previous = seen.get(digest, 0)
+        seen[digest] = previous | task_bit
+        return bool(previous & task_bit)
 
     def _input(self, task: str, row: dict, location: str):
         for key in REQUIRED_FIELDS[task]:
@@ -332,81 +328,124 @@ class MixedWorkloadDataset(BenchmarkDataset):
             }
             for task in TASKS
         }
-        seen_inputs: dict[str, tuple[str, str]] = {}
-        seen_prompts: dict[str, tuple[str, str]] = {}
+        seen_inputs: dict[str, int] = {}
+        seen_prompts: dict[str, int] = {}
+        input_duplicates: Counter = Counter()
+        # Discover conflicts before any sampling. Spool prompts instead of
+        # retaining the full raw datasets in memory or rendering them twice.
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as candidates:
+            for task in TASKS:
+                for file in self.files[task]:
+                    for number, row in self._rows(task, file):
+                        self.stats[task]["read"] += 1
+                        location = f"{file['source_file']}:{number}"
+                        parsed = self._input(task, row, location)
+                        if parsed is None:
+                            continue
+                        text, sample_id, extra = parsed
+                        max_tokens = self._max_tokens(task, row, tokenizer)
+                        if max_tokens is None:
+                            continue
+                        input_hash = _hash(text)
+                        if self._duplicate(seen_inputs, input_hash, task):
+                            input_duplicates[task, input_hash] += 1
+                            continue
+                        body = SUMMARY_PREFIX + text if task == "summary" else text
+                        prompt = tokenizer.apply_chat_template(
+                            [{"role": "user", "content": body}],
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                        if not isinstance(prompt, str) or not prompt:
+                            raise ValueError(
+                                f"{location}: chat template must render text"
+                            )
+                        prompt_hash = _hash(prompt)
+                        self._duplicate(seen_prompts, prompt_hash, task)
+                        metadata = {
+                            "source_sample_id": sample_id
+                            if sample_id is not None
+                            else f"{file['file_id']}:row:{number}",
+                            "source_dataset": DATASETS[task],
+                            "task_type": task,
+                            "source_split": "validation"
+                            if task == "summary"
+                            else "train",
+                            "prompt_hash": prompt_hash,
+                            "input_hash": input_hash,
+                            "prompt": prompt,
+                            "prompt_len": len(
+                                tokenizer(prompt, add_special_tokens=False).input_ids
+                            ),
+                            "max_tokens": max_tokens,
+                            "source_file": file["source_file"],
+                            "file_id": file["file_id"],
+                            "source_row": number,
+                            **extra,
+                        }
+                        candidates.write(
+                            json.dumps(metadata, ensure_ascii=False) + "\n"
+                        )
+
+            # More than one set bit means this hash occurs in multiple types.
+            conflicting_inputs = {
+                digest for digest, mask in seen_inputs.items() if mask & (mask - 1)
+            }
+            conflicting_prompts = {
+                digest for digest, mask in seen_prompts.items() if mask & (mask - 1)
+            }
+            del seen_inputs, seen_prompts
+            rngs = {
+                task: random.Random(f"{self.random_seed}:mixed:sample:{task}")
+                for task in TASKS
+            }
+            reservoirs: dict[str, list[MixedSampleRequest]] = {t: [] for t in TASKS}
+            eligible_prompts: set[str] = set()
+            candidates.seek(0)
+            for line in candidates:
+                metadata = json.loads(line)
+                task = metadata["task_type"]
+                copies = 1 + input_duplicates[task, metadata["input_hash"]]
+                if (
+                    metadata["input_hash"] in conflicting_inputs
+                    or metadata["prompt_hash"] in conflicting_prompts
+                ):
+                    # Conflicts take precedence over same-type deduplication:
+                    # count every valid source row once, including its copies.
+                    self.stats[task]["excluded"] += copies
+                    self.stats[task]["exclusion_reasons"]["cross_type_conflict"] += (
+                        copies
+                    )
+                    continue
+                self.stats[task]["duplicate"] += copies - 1
+                if metadata["prompt_hash"] in eligible_prompts:
+                    self.stats[task]["duplicate"] += 1
+                    continue
+                eligible_prompts.add(metadata["prompt_hash"])
+                self.stats[task]["eligible"] += 1
+                request = MixedSampleRequest(
+                    prompt=metadata["prompt"],
+                    prompt_len=metadata["prompt_len"],
+                    expected_output_len=metadata["max_tokens"],
+                    metadata=metadata,
+                )
+                reservoir = reservoirs[task]
+                if len(reservoir) < self.counts[task]:
+                    reservoir.append(request)
+                else:
+                    index = rngs[task].randrange(self.stats[task]["eligible"])
+                    if index < self.counts[task]:
+                        reservoir[index] = request
         for task in TASKS:
-            # Reservoir sampling bounds stored prompts to the requested count,
-            # while still checking every row for invalid data and type conflicts.
-            rng = random.Random(f"{self.random_seed}:mixed:sample:{task}")
-            reservoir: list[MixedSampleRequest] = []
-            for file in self.files[task]:
-                for number, row in self._rows(task, file):
-                    self.stats[task]["read"] += 1
-                    location = f"{file['source_file']}:{number}"
-                    parsed = self._input(task, row, location)
-                    if parsed is None:
-                        continue
-                    text, sample_id, extra = parsed
-                    max_tokens = self._max_tokens(task, row, tokenizer)
-                    if max_tokens is None:
-                        continue
-                    input_hash = _hash(text)
-                    if self._duplicate(seen_inputs, input_hash, task, location):
-                        self.stats[task]["duplicate"] += 1
-                        continue
-                    seen_inputs[input_hash] = (task, location)
-                    body = SUMMARY_PREFIX + text if task == "summary" else text
-                    prompt = tokenizer.apply_chat_template(
-                        [{"role": "user", "content": body}],
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    if not isinstance(prompt, str) or not prompt:
-                        raise ValueError(f"{location}: chat template must render text")
-                    prompt_hash = _hash(prompt)
-                    if self._duplicate(seen_prompts, prompt_hash, task, location):
-                        self.stats[task]["duplicate"] += 1
-                        continue
-                    seen_prompts[prompt_hash] = (task, location)
-                    prompt_len = len(
-                        tokenizer(prompt, add_special_tokens=False).input_ids
-                    )
-                    metadata = {
-                        "source_sample_id": sample_id
-                        if sample_id is not None
-                        else f"{file['file_id']}:row:{number}",
-                        "source_dataset": DATASETS[task],
-                        "task_type": task,
-                        "source_split": "validation" if task == "summary" else "train",
-                        "prompt_hash": prompt_hash,
-                        "input_hash": input_hash,
-                        "prompt": prompt,
-                        "prompt_len": prompt_len,
-                        "max_tokens": max_tokens,
-                        "source_file": file["source_file"],
-                        "file_id": file["file_id"],
-                        "source_row": number,
-                        **extra,
-                    }
-                    request = MixedSampleRequest(
-                        prompt=prompt,
-                        prompt_len=prompt_len,
-                        expected_output_len=max_tokens,
-                        metadata=metadata,
-                    )
-                    self.stats[task]["eligible"] += 1
-                    if len(reservoir) < self.counts[task]:
-                        reservoir.append(request)
-                    else:
-                        index = rng.randrange(self.stats[task]["eligible"])
-                        if index < self.counts[task]:
-                            reservoir[index] = request
+            reservoir = reservoirs[task]
             if len(reservoir) < self.counts[task]:
                 raise ValueError(
                     f"mixed {task}: insufficient valid unique samples; requested "
                     f"{self.counts[task]}, available {len(reservoir)}; "
                     f"stats={self.stats[task]}"
                 )
+        for task in TASKS:
+            reservoir = reservoirs[task]
             self.requests.extend(reservoir)
             self.stats[task]["sampled"] = len(reservoir)
         random.Random(f"{self.random_seed}:mixed:shuffle").shuffle(self.requests)

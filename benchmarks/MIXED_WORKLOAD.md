@@ -74,9 +74,11 @@ Article:
 
 文件按相对路径排序。输入类型错误、空输入、语言不符、缺失/非法参考回答分别计入 exclusion_reasons；结构不支持、缺少必需字段或列（包括空 Parquet 文件）、非法 JSON 报出来源位置。
 
-对首尾处理后的源输入及最终 prompt 做精确 SHA256 去重，不归一化内部空白、大小写或 Unicode。跨来源发现相同输入但类型冲突时报告两处位置并失败。有效唯一候选不足时报错，不调用原生重复补齐。
+对首尾处理后的源输入及最终 prompt 做精确 SHA256 去重，不归一化内部空白、大小写或 Unicode。先扫描所有启用来源并确定跨类型冲突：任一层哈希出现在多个类型中，就排除所有携带该冲突哈希的有效候选，再对剩余候选做同类型去重和抽样。不保留先读到的类型，也不通过更换 seed 或重试规避冲突。有效唯一候选不足仍报错，不调用原生重复补齐。
 
-每类使用由 seed 派生的局部 RNG 做无放回 reservoir 抽样，再用独立局部 RNG 混排整个样本对象；不会消耗全局 Python/NumPy RNG。扫描所有启用来源，但只保留所需数量的最终 prompt；去重索引仍随唯一候选数量增长。复现需保持文件内容及路径集合、tokenizer/模板/设置、数量、输出长度模式、seed 和 Python 随机实现一致。
+冲突记录计入各类 `stats.excluded` 和 `stats.exclusion_reasons.cross_type_conflict`，dry-run 与导出的 run.stats 共用这些计数。冲突计数优先于同类型重复计数：例如 chat 中同一输入出现两次、code 中出现一次，则 chat 排除 2 条、code 排除 1 条；同一条记录同时命中两层冲突只计一次。不属于跨类型冲突的同类型重复继续计入 duplicate。
+
+候选正文渲染一次后暂存于自动清理的临时文件；完成两层冲突检测后，重读暂存候选，先过滤冲突、再按类用原有 seed 派生的局部 RNG 做无放回 reservoir 抽样，最后用独立局部 RNG 混排整个样本对象。抽样开始前全部冲突已确定，不会留下早先选入 reservoir 的冲突请求，也不会消耗全局 Python/NumPy RNG。内存只保留所需数量的最终请求；哈希索引随唯一候选数增长，临时磁盘随有效候选 prompt 总量增长，正常结束或异常退出均自动关闭清理。复现需保持文件内容及路径集合、tokenizer/模板/设置、数量、输出长度模式、seed 和 Python 随机实现一致。
 
 每个请求的 metadata 保存混排后的 request_index、source_sample_id、source_dataset、task_type、prompt_hash、input_hash、最终 prompt、prompt_len、解析后的 max_tokens、source_split、来源文件与从 1 开始的原始行号，以及 code 的 resource/lang 和 chat 审核状态。code 无原生 ID，以文件标识和行号定位。它们只是客户端标识，未关联服务端 request_id。
 
@@ -103,7 +105,7 @@ python benchmarks/benchmark_serving.py \
 
 ## 验证与未验证事项
 
-- **13 项轻量单测通过**：实际 Parquet/JSONL 小样例，三类映射与答案隔离，两种输出模式及覆盖时缺参考，模板/代码空白，真实 HF 合成 tokenizer 的 BOS 对照，数量校验、无放回与复现、全局 RNG 不变、去重/冲突、错误定位、元数据/导出顺序、同入口 dry-run 返回点，以及原生非 mixed ShareGPT 行为。
+- **15 项轻量单测通过**：实际 Parquet/JSONL 小样例，三类映射与答案隔离，两种输出模式及覆盖时缺参考，模板/代码空白，真实 HF 合成 tokenizer 的 BOS 对照，数量校验、无放回与复现、全局 RNG 不变、去重/冲突、错误定位、元数据/导出顺序、同入口 dry-run 返回点，以及原生非 mixed ShareGPT 行为。跨类型修复测试覆盖输入哈希和最终 prompt 哈希冲突、双方全部排除（含重复记录）、冲突晚出现时抽样尚未开始、同类型去重保留、过滤后数量不足，以及 dry-run/导出的冲突计数。
 - 原生 benchmark 定义的隔离测试使用模拟发送函数，确认 1 次初始探测与 6 次正式调用共享 max_tokens 与特殊 token 参数；没有发 HTTP。发送函数内 max_tokens 的既有映射也作了静态核对。
 - Ruff lint/格式检查、Python 语法编译、`git diff --check` 通过；原生受保护文件与基线无差异，7 个非 main 的 serving 定义保持一致；49 个原生 CLI 参数声明只在 dataset-name 的 choices 增加 mixed，原默认值未改。
 - 本轮使用现有的 Python 3.12 临时测试环境及其已安装的 NumPy/PyArrow/Transformers，没有安装或升级包、改动依赖文件或环境配置。
@@ -113,3 +115,5 @@ python benchmarks/benchmark_serving.py \
 测试命令：`python -m unittest discover -s tests/benchmarks -p test_mixed_workload_dataset.py -v`（使用已经具备测试所需库的环境）。
 
 最终 diff：`benchmark_serving.py` 增加 36 行、删除 2 行；新增一个数据集模块、一个测试文件和本说明。原生类、发送器、引擎、另一套 benchmark、环境与锁文件均保持原样，用户的 AGENTS.md 不计入本次改动。下一步需要在已有完整 vLLM 环境中填写真实本地路径执行上述 dry-run，本批不自动安装依赖或启动真实 benchmark。
+
+2026-10-21 跨类型去重修复基于 `research-v0.9.1` 的 `351788175a207bf268d6d14b37dba7f92a4a4d41`，仅改动数据集扩展、对应测试与本说明；没有新增入口、参数或修改原生发送/指标/V1 代码。与修复前 HEAD 对照的 24 组无冲突小样例（参考/固定输出上限、三种数量组合、四个 seed）均得到完全一致的请求顺序、元数据和 stats。本机未重跑用户真实数据的完整 dry-run，仍需用原命令和原 seed 在真实数据上核查过滤计数及各类剩余数量。

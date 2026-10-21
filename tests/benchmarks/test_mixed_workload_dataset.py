@@ -390,7 +390,7 @@ class MixedDatasetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             self.dataset(counts=(-1, 1, 1))
 
-    def test_source_errors_and_type_conflicts(self):
+    def test_source_errors_and_conflict_shortage(self):
         path = (
             Path(self.paths["code_path"])
             / "CodeFeedback-Filtered-Instruction.jsonl"
@@ -415,10 +415,17 @@ class MixedDatasetTests(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        dataset = self.dataset(counts=(1, 1, 0))
         with self.assertRaisesRegex(
-            ValueError, "input/type conflict: chat.*code"
+            ValueError, "mixed code: insufficient.*requested 1, available 0"
         ):
-            self.dataset(counts=(1, 1, 0)).sample(self.tokenizer, 2)
+            dataset.sample(self.tokenizer, 2)
+        for task in ("chat", "code"):
+            self.assertEqual(
+                dataset.stats[task]["exclusion_reasons"]["cross_type_conflict"],
+                1,
+            )
+        self.assertEqual(dataset.requests, [])
         summary = Path(self.paths["summary_path"]) / "3.0.0"
         wrong = summary.rename(summary.with_name("2.0.0"))
         dataset = self.dataset(counts=(0, 0, 1))
@@ -473,7 +480,7 @@ class MixedDatasetTests(unittest.TestCase):
         ):
             self.dataset(counts=(0, 0, 1)).sample(self.tokenizer, 1)
 
-    def test_final_prompt_type_conflict_is_reported(self):
+    def test_final_prompt_type_conflict_excludes_all_copies(self):
         path = Path(self.paths["chat_path"]) / "data" / "train-00004.parquet"
         pq.write_table(
             pa.Table.from_pylist(
@@ -494,10 +501,143 @@ class MixedDatasetTests(unittest.TestCase):
             ),
             path,
         )
-        with self.assertRaisesRegex(
-            ValueError, "input/type conflict: chat.*summary"
+        dataset = self.dataset(counts=(1, 0, 1))
+        requests = dataset.sample(self.tokenizer, 2)
+        conflict_prompt = self.tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": MIXED.SUMMARY_PREFIX
+                    + "The city restored a bridge.",
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        self.assertTrue(all(r.prompt != conflict_prompt for r in requests))
+        self.assertEqual(
+            dataset.stats["chat"]["exclusion_reasons"]["cross_type_conflict"], 1
+        )
+        self.assertEqual(
+            dataset.stats["summary"]["exclusion_reasons"][
+                "cross_type_conflict"
+            ],
+            2,
+        )
+        self.assertEqual(dataset.stats["summary"]["duplicate"], 0)
+        self.assertEqual(dataset.stats["summary"]["eligible"], 1)
+
+    def test_input_conflict_excludes_both_types_and_preserves_other_duplicates(
+        self,
+    ):
+        path = (
+            Path(self.paths["code_path"])
+            / "CodeFeedback-Filtered-Instruction.jsonl"
+        )
+        shared = "Explain rain.\n\nKeep this line."
+        with path.open("a", encoding="utf-8") as stream:
+            for text in (shared, " \n" + shared + "\n "):
+                stream.write(
+                    json.dumps(
+                        {
+                            "query": text,
+                            "lang": "python",
+                            "resource": "conflict",
+                            "answer": "REFERENCE",
+                        }
+                    )
+                    + "\n"
+                )
+        dataset = self.dataset(counts=(1, 2, 0))
+        requests = dataset.sample(self.tokenizer, 3)
+        self.assertTrue(
+            all(
+                r.metadata["input_hash"] != MIXED._hash(shared)
+                for r in requests
+            )
+        )
+        self.assertEqual(
+            [dataset.stats[t]["sampled"] for t in MIXED.TASKS], [1, 2, 0]
+        )
+        self.assertEqual(dataset.stats["chat"]["duplicate"], 0)
+        self.assertEqual(dataset.stats["code"]["duplicate"], 1)
+        for task in ("chat", "code"):
+            stats = dataset.stats[task]
+            self.assertEqual(
+                stats["exclusion_reasons"]["cross_type_conflict"], 2
+            )
+            self.assertEqual(
+                stats["read"],
+                stats["excluded"] + stats["duplicate"] + stats["eligible"],
+            )
+        output = self.root / "conflicts.json"
+        dataset.export(
+            str(output), tokenizer_id="synthetic", tokenizer_mode="auto"
+        )
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["requests"], [r.metadata for r in requests])
+        for task in ("chat", "code"):
+            self.assertEqual(
+                payload["run"]["stats"][task]["exclusion_reasons"][
+                    "cross_type_conflict"
+                ],
+                2,
+            )
+        with contextlib.redirect_stdout(io.StringIO()) as console:
+            dataset.print_inspection()
+        self.assertIn('"cross_type_conflict": 2', console.getvalue())
+
+    def test_late_conflict_is_filtered_before_reservoir_rng_starts(self):
+        path = (
+            Path(self.paths["code_path"])
+            / "CodeFeedback-Filtered-Instruction.jsonl"
+        )
+        shared = "Explain rain.\n\nKeep this line."
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "query": shared,
+                        "lang": "python",
+                        "resource": "late-conflict",
+                        "answer": "REFERENCE",
+                    }
+                )
+                + "\n"
+            )
+        dataset = self.dataset(counts=(1, 1, 0))
+        rows = dataset._rows
+        random_class = random.Random
+        code_scanned = False
+
+        def tracked_rows(task, file):
+            nonlocal code_scanned
+            yield from rows(task, file)
+            if task == "code":
+                code_scanned = True
+
+        def checked_rng(seed):
+            self.assertTrue(
+                code_scanned, "sampling started before late conflict discovery"
+            )
+            return random_class(seed)
+
+        with (
+            patch.object(dataset, "_rows", side_effect=tracked_rows),
+            patch.object(MIXED.random, "Random", side_effect=checked_rng),
         ):
-            self.dataset(counts=(1, 0, 1)).sample(self.tokenizer, 2)
+            requests = dataset.sample(self.tokenizer, 2)
+        self.assertTrue(
+            all(
+                r.metadata["input_hash"] != MIXED._hash(shared)
+                for r in requests
+            )
+        )
+        chat = next(r for r in requests if r.metadata["task_type"] == "chat")
+        self.assertEqual(chat.metadata["source_sample_id"], "c1")
+        self.assertEqual(
+            requests, self.dataset(counts=(1, 1, 0)).sample(self.tokenizer, 2)
+        )
 
     def test_real_hf_tokenizer_template_and_bos(self):
         from tokenizers import Tokenizer as BackendTokenizer
