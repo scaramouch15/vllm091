@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import aiohttp
 import huggingface_hub.constants
@@ -34,6 +34,8 @@ class RequestFuncInput:
     multi_modal_content: Optional[dict] = None
     ignore_eos: bool = False
     language: Optional[str] = None
+    request_id: Optional[str] = None
+    collection_context: Optional[Any] = None
 
 
 @dataclass
@@ -288,6 +290,11 @@ async def async_request_openai_completions(
         output.prompt_len = request_func_input.prompt_len
 
         generated_text = ""
+        if request_func_input.collection_context is not None:
+            request_func_input.request_id = request_func_input.collection_context.start(
+                payload, api_url)
+        if request_func_input.request_id is not None:
+            headers["X-Request-Id"] = request_func_input.request_id
         st = time.perf_counter()
         most_recent_timestamp = st
         try:
@@ -347,6 +354,8 @@ async def async_request_openai_completions(
 
     if pbar:
         pbar.update(1)
+    if request_func_input.collection_context is not None:
+        request_func_input.collection_context.finish(output)
     return output
 
 

@@ -14,6 +14,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.metrics.request_collector import FrontendCollector
 from vllm.v1.metrics.stats import (IterationStats, LoRARequestStates,
                                    RequestStateStats)
 
@@ -236,8 +237,12 @@ class OutputProcessor:
         self,
         tokenizer: TokenizerGroup,
         log_stats: bool,
+        request_collector: Optional[FrontendCollector] = None,
     ):
+        if request_collector is not None and not log_stats:
+            raise ValueError("R1 collection requires native log_stats")
         self.log_stats = log_stats
+        self.request_collector = request_collector
         self.tokenizer = tokenizer
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
@@ -253,6 +258,10 @@ class OutputProcessor:
         """Propagate error to all generate() tasks."""
 
         for _, state in self.request_states.items():
+            if self.request_collector is not None:
+                self.request_collector.diagnostic(state.request_id,
+                                                  "output_handler_error",
+                                                  type(e).__name__)
             assert state.queue is not None
             state.queue.put(e)
 
@@ -264,6 +273,8 @@ class OutputProcessor:
         for request_id in request_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                if self.request_collector is not None:
+                    self.request_collector.diagnostic(request_id, "aborted")
                 self.lora_states.abort_request(req_state)
                 request_ids_to_abort.append(request_id)
             else:
@@ -383,6 +394,13 @@ class OutputProcessor:
                 # Track per-request stats
                 self._update_stats_from_finished(req_state, finish_reason,
                                                  iteration_stats)
+                if self.request_collector is not None:
+                    native_finished = None
+                    if iteration_stats and iteration_stats.finished_requests:
+                        native_finished = iteration_stats.finished_requests[-1]
+                    self.request_collector.finished(
+                        req_state, native_finished,
+                        "frontend_stop_string" if stop_string else "engine")
 
         self.lora_states.update_iteration_stats(iteration_stats)
 

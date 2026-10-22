@@ -26,6 +26,7 @@ from vllm.v1.core.sched.utils import check_stop
 from vllm.v1.engine import (EngineCoreEventType, EngineCoreOutput,
                             EngineCoreOutputs)
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.request_collector import CollectionConfig, CoreCollector
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -154,6 +155,26 @@ class Scheduler(SchedulerInterface):
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
+
+        self.request_collector = None
+        collection_config = CollectionConfig.from_env()
+        if collection_config is not None:
+            collection_config.require_stats(self.log_stats)
+            parallel_config = vllm_config.parallel_config
+            self.request_collector = CoreCollector(collection_config, {
+                "max_num_seqs": self.max_num_running_reqs,
+                "max_num_batched_tokens": self.max_num_scheduled_tokens,
+                "max_model_len": self.max_model_len,
+                "enable_prefix_caching": (
+                    self.cache_config.enable_prefix_caching),
+                "enable_chunked_prefill": getattr(
+                    self.scheduler_config, "enable_chunked_prefill", None),
+                "data_parallel_rank": parallel_config.data_parallel_rank,
+                "tensor_parallel_size": parallel_config.tensor_parallel_size,
+                "pipeline_parallel_size": (
+                    parallel_config.pipeline_parallel_size),
+                "num_gpu_blocks": self.cache_config.num_gpu_blocks,
+            })
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -316,6 +337,13 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests: deque[Request] = deque()
 
         # Next, schedule the WAITING requests.
+        admission_snapshot = None
+        if (self.request_collector is not None and not preempted_reqs
+                and self.waiting and token_budget > 0
+                and len(self.running) < self.max_num_running_reqs):
+            admission_snapshot = self.request_collector.snapshot(
+                self.running, token_budget, self.kv_cache_manager,
+                scheduled_timestamp)
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -457,6 +485,10 @@ class Scheduler(SchedulerInterface):
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    if (self.request_collector is not None
+                            and admission_snapshot is not None):
+                        self.request_collector.admit(request.request_id,
+                                                     admission_snapshot)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
                 else:
@@ -910,6 +942,8 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        if self.request_collector is not None:
+            self.request_collector.forget(request_id)
         self._cached_reqs_data.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
@@ -968,6 +1002,8 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        if self.request_collector is not None:
+            self.request_collector.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
 

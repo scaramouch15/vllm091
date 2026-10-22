@@ -284,6 +284,12 @@ class EngineCore:
         return engine_core_outputs, scheduled_batch
 
     def shutdown(self):
+        # Drain before model teardown: the parent gives Core a bounded grace
+        # period after SIGTERM. Scheduler.shutdown also closes idempotently.
+        collector = getattr(getattr(self, "scheduler", None),
+                            "request_collector", None)
+        if collector is not None:
+            collector.close()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()

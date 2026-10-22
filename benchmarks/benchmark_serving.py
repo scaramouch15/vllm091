@@ -291,11 +291,16 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    request_collector: Optional[Any] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    collection_contexts = None
+    if request_collector is not None:
+        collection_contexts = request_collector.prepare(input_requests)
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len, test_mm_content = (
@@ -318,6 +323,8 @@ async def benchmark(
         ignore_eos=ignore_eos,
         extra_body=extra_body,
     )
+    if request_collector is not None:
+        test_input.collection_context = request_collector.probe(input_requests[0])
 
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
@@ -398,6 +405,8 @@ async def benchmark(
             ignore_eos=ignore_eos,
             extra_body=extra_body,
         )
+        if collection_contexts is not None:
+            request_func_input.collection_context = collection_contexts[id(request)]
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
@@ -814,29 +823,66 @@ def main(args: argparse.Namespace):
     gc.collect()
     gc.freeze()
 
-    benchmark_result = asyncio.run(
-        benchmark(
-            backend=backend,
-            api_url=api_url,
-            base_url=base_url,
-            model_id=model_id,
-            model_name=model_name,
-            tokenizer=tokenizer,
-            input_requests=input_requests,
-            logprobs=args.logprobs,
-            request_rate=args.request_rate,
-            burstiness=args.burstiness,
-            disable_tqdm=args.disable_tqdm,
-            profile=args.profile,
-            selected_percentile_metrics=args.percentile_metrics.split(","),
-            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
-            ignore_eos=args.ignore_eos,
-            goodput_config_dict=goodput_config_dict,
-            max_concurrency=args.max_concurrency,
-            lora_modules=args.lora_modules,
-            extra_body=sampling_params,
+    request_collector = None
+    if os.environ.get("VLLM_R1_COLLECT", "0") != "0":
+        # Load the shared stdlib-only implementation without importing vllm:
+        # the native benchmark may run on a separate, CPU-only client machine.
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        name = "_vllm_r1_request_collector"
+        path = (Path(__file__).resolve().parents[1]
+                / "vllm/v1/metrics/request_collector.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        collection_module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = collection_module
+        spec.loader.exec_module(collection_module)
+        config = collection_module.CollectionConfig.from_env()
+        request_collector = collection_module.ClientCollector(
+            config, backend=backend, endpoint=args.endpoint,
+            dataset_name=args.dataset_name, profile=args.profile,
+            lora_modules=args.lora_modules, metadata={
+                "seed": args.seed, "model": model_id,
+                "request_rate": ("inf" if args.request_rate == float("inf")
+                                 else args.request_rate),
+                "burstiness": args.burstiness,
+                "max_concurrency": args.max_concurrency,
+                "expected_main_requests": len(input_requests),
+                "expected_probe_requests": 1,
+                "sampling_params": sampling_params, "ignore_eos": args.ignore_eos,
+                "dataset": mixed_dataset.report() if mixed_dataset else None,
+            })
+    try:
+        benchmark_result = asyncio.run(
+            benchmark(
+                backend=backend,
+                api_url=api_url,
+                base_url=base_url,
+                model_id=model_id,
+                model_name=model_name,
+                tokenizer=tokenizer,
+                input_requests=input_requests,
+                logprobs=args.logprobs,
+                request_rate=args.request_rate,
+                burstiness=args.burstiness,
+                disable_tqdm=args.disable_tqdm,
+                profile=args.profile,
+                selected_percentile_metrics=args.percentile_metrics.split(","),
+                selected_percentiles=[
+                    float(p) for p in args.metric_percentiles.split(",")
+                ],
+                ignore_eos=args.ignore_eos,
+                goodput_config_dict=goodput_config_dict,
+                max_concurrency=args.max_concurrency,
+                lora_modules=args.lora_modules,
+                extra_body=sampling_params,
+                request_collector=request_collector,
+            )
         )
-    )
+    finally:
+        if request_collector is not None:
+            request_collector.close()
 
     # Save config and results to json
     if args.save_result or args.append_result:

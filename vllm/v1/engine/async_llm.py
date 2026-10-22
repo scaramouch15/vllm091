@@ -38,6 +38,8 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.metrics.loggers import (StatLoggerBase, StatLoggerFactory,
                                      setup_default_loggers)
 from vllm.v1.metrics.prometheus import shutdown_prometheus
+from vllm.v1.metrics.request_collector import (CollectionConfig,
+                                             FrontendCollector)
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 logger = init_logger(__name__)
@@ -93,6 +95,9 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.log_requests = log_requests
         self.log_stats = log_stats
+        self.collection_config = CollectionConfig.from_env()
+        if self.collection_config is not None:
+            self.collection_config.require_stats(log_stats)
 
         # Set up stat loggers; independent set for each DP rank.
         self.stat_loggers: list[list[StatLoggerBase]] = setup_default_loggers(
@@ -128,6 +133,13 @@ class AsyncLLM(EngineClient):
             client_addresses=client_addresses,
             client_index=client_index,
         )
+        # Open per-process files only after child engine processes are started.
+        if self.collection_config is not None:
+            self.output_processor.request_collector = FrontendCollector(
+                self.collection_config, {
+                    "model": self.model_config.model,
+                    "client_index": client_index, "log_stats": self.log_stats,
+                })
         if self.stat_loggers:
             for stat_logger in self.stat_loggers[0]:
                 stat_logger.log_engine_initialized()
@@ -202,13 +214,20 @@ class AsyncLLM(EngineClient):
     def shutdown(self):
         """Shutdown, cleaning up the background proc and IPC."""
 
-        shutdown_prometheus()
-
-        if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown()
-
-        if handler := getattr(self, "output_handler", None):
-            handler.cancel()
+        try:
+            shutdown_prometheus()
+            if engine_core := getattr(self, "engine_core", None):
+                engine_core.shutdown()
+        finally:
+            if handler := getattr(self, "output_handler", None):
+                handler.cancel()
+            processor = getattr(self, "output_processor", None)
+            collector = getattr(processor, "request_collector", None)
+            if collector is not None:
+                for request_id in processor.request_states:
+                    collector.diagnostic(request_id, "shutdown_unfinished")
+                collector.close()
+                processor.request_collector = None
 
     async def add_request(
         self,
@@ -230,6 +249,8 @@ class AsyncLLM(EngineClient):
 
         assert isinstance(params, SamplingParams), \
             "Pooling is not supported in V1"
+        if self.collection_config is not None:
+            self.collection_config.validate_engine_request(request_id, params)
 
         # Create a new output collector for the request.
         queue = RequestOutputCollector(output_kind=params.output_kind)
@@ -335,6 +356,7 @@ class AsyncLLM(EngineClient):
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
         except (asyncio.CancelledError, GeneratorExit):
+            self._record_collection_error(request_id, "client_cancelled")
             await self.abort(request_id)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
@@ -342,22 +364,35 @@ class AsyncLLM(EngineClient):
 
         # Engine is dead. Do not abort since we shut down.
         except EngineDeadError:
+            self._record_collection_error(request_id, "engine_dead")
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
         # Request validation error.
         except ValueError:
+            self._record_collection_error(request_id, "validation_error")
             if self.log_requests:
                 logger.info("Request %s failed (bad request).", request_id)
             raise
 
         # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
+            self._record_collection_error(request_id, "generate_error",
+                                          type(e).__name__)
             await self.abort(request_id)
             if self.log_requests:
                 logger.info("Request %s failed.", request_id)
             raise EngineGenerateError() from e
+
+    def _record_collection_error(self, request_id: str, reason: str,
+                                 detail: Optional[str] = None):
+        collector = self.output_processor.request_collector
+        # Late disconnects after a completed STOP (including stop strings)
+        # must not relabel an already-finished request as a cancellation.
+        if (collector is not None and (reason != "client_cancelled"
+                or request_id in self.output_processor.request_states)):
+            collector.diagnostic(request_id, reason, detail)
 
     def _run_output_handler(self):
         """Background loop: pulls from EngineCore and pushes to AsyncStreams."""
