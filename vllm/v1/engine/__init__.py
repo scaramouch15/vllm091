@@ -66,6 +66,10 @@ class EngineCoreRequest(
     # a wave finished notification is received.
     current_wave: int = 0
 
+    # Optional shadow-only numbers; frontend text never crosses Core IPC.
+    # Appended to preserve existing array positions; use matching frontend/Core.
+    r1_shadow_lengths: Optional[tuple[float, float, float]] = None
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""

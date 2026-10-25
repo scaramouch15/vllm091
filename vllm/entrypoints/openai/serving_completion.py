@@ -58,6 +58,10 @@ class OpenAIServingCompletion(OpenAIServing):
                          models=models,
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)
+        import os
+        if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
+            if getattr(engine_client, "r1_shadow", None) is None:
+                raise ValueError("R1 shadow requires the V1 AsyncLLM backend")
         self.default_sampling_params = (
             self.model_config.get_diff_sampling_param())
         if self.default_sampling_params:
@@ -167,6 +171,11 @@ class OpenAIServingCompletion(OpenAIServing):
                         self.default_sampling_params)
 
                 request_id_item = f"{request_id}-{i}"
+                shadow = getattr(self.engine_client, "r1_shadow", None)
+                if shadow is not None:
+                    shadow.prepare(request, sampling_params, request_prompts[i],
+                                   engine_prompt, request_id_item,
+                                   lora_request, prompt_adapter_request)
 
                 self._log_inputs(request_id_item,
                                  request_prompts[i],

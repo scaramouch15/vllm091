@@ -140,6 +140,13 @@ class AsyncLLM(EngineClient):
                     "model": self.model_config.model,
                     "client_index": client_index, "log_stats": self.log_stats,
                 })
+        # Initialize after Core launch: no writer threads are inherited by it.
+        import os
+        self.r1_shadow = None
+        if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
+            from vllm.v1.metrics.r1_shadow import create_shadow
+            self.r1_shadow = create_shadow(vllm_config, "frontend")
+        self.processor.r1_shadow = self.r1_shadow
         if self.stat_loggers:
             for stat_logger in self.stat_loggers[0]:
                 stat_logger.log_engine_initialized()
@@ -219,6 +226,8 @@ class AsyncLLM(EngineClient):
             if engine_core := getattr(self, "engine_core", None):
                 engine_core.shutdown()
         finally:
+            if shadow := getattr(self, "r1_shadow", None):
+                shadow.close()
             if handler := getattr(self, "output_handler", None):
                 handler.cancel()
             processor = getattr(self, "output_processor", None)

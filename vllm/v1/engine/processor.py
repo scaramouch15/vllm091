@@ -324,6 +324,15 @@ class Processor:
             else:
                 sorted_mm_inputs = orig_sorted_mm_inputs
 
+        shadow_lengths = None
+        if (getattr(self, "r1_shadow", None) is not None
+                or (sampling_params.extra_args and
+                    "_vllm_r1_shadow_static_v1" in sampling_params.extra_args)):
+            from vllm.v1.metrics.r1_shadow import consume_static
+            shadow_lengths = consume_static(
+                sampling_params, len(decoder_inputs["prompt_token_ids"]),
+                getattr(self, "r1_shadow", None), request_id)
+
         return decoder_inputs.get("prompt"), EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=decoder_inputs["prompt_token_ids"],
@@ -336,6 +345,7 @@ class Processor:
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             data_parallel_rank=data_parallel_rank,
+            r1_shadow_lengths=shadow_lengths,
         )
 
     def _validate_model_inputs(self,

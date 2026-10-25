@@ -176,6 +176,12 @@ class Scheduler(SchedulerInterface):
                 "num_gpu_blocks": self.cache_config.num_gpu_blocks,
             })
 
+        import os
+        self.r1_shadow = None
+        if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
+            from vllm.v1.metrics.r1_shadow import create_shadow
+            self.r1_shadow = create_shadow(vllm_config, "core")
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -344,6 +350,17 @@ class Scheduler(SchedulerInterface):
             admission_snapshot = self.request_collector.snapshot(
                 self.running, token_budget, self.kv_cache_manager,
                 scheduled_timestamp)
+        # Shadow reads only O(1) state and a bounded independent candidate list.
+        # This is after running scheduling, before waiting admission, not after GPU execution.
+        shadow = getattr(self, "r1_shadow", None)
+        shadow_decision = None
+        if (shadow is not None and not preempted_reqs and self.waiting
+                and token_budget > 0
+                and len(self.running) < self.max_num_running_reqs):
+            shadow_decision = shadow.sweep(
+                self.waiting, self.running, self.kv_cache_manager,
+                token_budget, scheduled_timestamp,
+                getattr(admission_snapshot, "decision_batch_id", None))
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -485,6 +502,8 @@ class Scheduler(SchedulerInterface):
                                          scheduled_timestamp)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
+                    if shadow is not None:
+                        shadow.admit(request, shadow_decision)
                     if (self.request_collector is not None
                             and admission_snapshot is not None):
                         self.request_collector.admit(request.request_id,
@@ -941,6 +960,8 @@ class Scheduler(SchedulerInterface):
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
+        if shadow := getattr(self, "r1_shadow", None):
+            shadow.finish(request)
         request_id = request.request_id
         if self.request_collector is not None:
             self.request_collector.forget(request_id)
@@ -1002,6 +1023,8 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        if shadow := getattr(self, "r1_shadow", None):
+            shadow.close()
         if self.request_collector is not None:
             self.request_collector.close()
         if self.kv_event_publisher:

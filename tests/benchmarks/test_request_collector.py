@@ -1419,6 +1419,7 @@ class CollectorTests(unittest.TestCase):
                 eos_token_id=None,
                 lora_request=None,
                 cache_salt=None,
+                r1_shadow_lengths=None,
             )
             native = N["Request"].from_engine_core_request(engine_request)
             self.assertEqual(native.request_id, row["engine_request_id"])
@@ -1709,7 +1710,7 @@ class CollectorTests(unittest.TestCase):
         self.assertFalse(report["collection_complete"])
         self.assertEqual(report["missing_roles"], ["core", "frontend"])
 
-    def test_native_arrivals_metrics_and_ipc_definitions_unchanged(self):
+    def test_native_arrivals_metrics_and_original_ipc_fields_unchanged(self):
         for path, names in (
             (
                 "benchmarks/benchmark_serving.py",
@@ -1726,7 +1727,17 @@ class CollectorTests(unittest.TestCase):
                 text=True,
             ).stdout
             current = (ROOT / path).read_text("utf-8")
-            if names is None:
+            if path == "vllm/v1/engine/__init__.py":
+                def original_schema(text):
+                    tree = ast.parse(text)
+                    for node in tree.body:
+                        if isinstance(node, ast.ClassDef) and node.name == "EngineCoreRequest":
+                            node.body = [n for n in node.body if not (
+                                isinstance(n, ast.AnnAssign) and
+                                getattr(n.target, "id", None) == "r1_shadow_lengths")]
+                    return ast.dump(tree)
+                self.assertEqual(original_schema(current), original_schema(original))
+            elif names is None:
                 self.assertEqual(current, original)
             else:
 

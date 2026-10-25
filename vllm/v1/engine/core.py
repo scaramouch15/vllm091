@@ -290,6 +290,9 @@ class EngineCore:
                             "request_collector", None)
         if collector is not None:
             collector.close()
+        shadow = getattr(getattr(self, "scheduler", None), "r1_shadow", None)
+        if shadow is not None:
+            shadow.close()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
