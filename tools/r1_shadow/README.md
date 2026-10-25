@@ -56,19 +56,41 @@ token-ID、embeds、多 prompt、n>1、beam、截断（包括 -1）、特殊 tok
 
 ## 计时和写出
 
-perf_counter_ns 单调高精度计时。每个静态成功记录含 tfidf_ns、svd_ns、text_transform_ns（前两项合并区间）、length_head_ns（含 float64 组装与后处理）、static_compute_ns（prepare 开始至预测/临时值构造结束，含门禁，不含 emit）。summary 的 static_total_ns 包含门禁、失败/跳过、记录构造及入队；与 compute 是嵌套关系，不相加。
+所有区间使用 perf_counter_ns 单调墙钟，包含被操作系统暂停/争用的等待，不是纯 CPU 指令时间。新增完整前台阶段直方图独立于成功预测日志：正常关闭时在 shadow_summary.foreground_distributions 导出，不靠累计总时间推算分位数，不因逐条日志队列满而停止内存聚合。
 
-动态记录含 state_read_ns、extract_assemble_ns（从 sweep 开始至矩阵就绪，包含 state_read）、time_head_ns（批量三头及后处理/校验）、shadow_compute_ns（至候选记录构造结束，含上述区间）。summary 的 shadow_total_ns 再包含 emit 与返回开销，失败/空/间隔跳过也计入。不存在排序耗时项。候选数量会限制记录大小，但可变大小 JSON 的实际成本由后台度量。
+### 完整前台分布及有界方法
 
-日志复用 RecordWriter：每进程独立文件、1024 有界队列、put_nowait、约 1 秒或64条 flush、正常关闭最多2秒 drain。写入异常/队列满计数、首次报错后抑制重复刷屏；可能丢失 summary，自身 footer 的 dropped_records、serialization_errors、writer_errors 和 clean_shutdown/records_complete 必须一起检查。缺 footer 表示不完整或未确认完整，不代表全部丢失。两秒排空超时不是完整成功。
+- `overall` 按 stage 合并所有 outcome；`groups` 按 stage/outcome/candidate_count 分组。每组有 n、total_ns、min_ns、max_ns、非零 bins，以及 `p50_bounds_ns/p95_bounds_ns/p99_bounds_ns` 和对应 `p50_upper_ns/p95_upper_ns/p99_upper_ns`。没有观察时分位数是 null，不能当0；未发生的组不创建。
+- 这是**近似耗时分位数**：nearest-rank 落入的桶给出上下界，upper 字段是上界估计，不冒称原始样本精确分位数；与 NumPy 默认线性插值分位数不是同一口径。0–15ns 精确；其余每个2倍区间8个桶（保留4位有效二进制位），桶宽不超过下界的1/8，另保留 >=2**64 ns 的固定溢出桶（该尾桶不承诺上述相对精度）。最小/最大观测值收紧桶边界；保留 bins 可离线合并同口径分布。
+- 每组固定497个 uint64 计数器（原始桶数组3976字节），没有逐样本数组、随机采样或随请求数增长的 ID 集合。组数受候选上限K和固定stage/outcome约束；默认K=32的桶存储低于0.5MiB，极限K=4096时约32MiB，另有有界 Python 元数据。按需创建分组；首次建桶开销同样需要计入测量机制成本，不作零成本假设。
+- 更新为 O(1) 整数运算；只有关闭时计算分位数、合并 overall 和构造 summary。不新增“计时记录”的 emit，不递归计时或递归日志。`timing_bookkeeping_calls/ns` 单独汇总最后统计更新的成本，包括按需创建桶，不再为它建立嵌套计时分布。summary_build_ns 记录关闭时汇总构造成本。
 
-summary.counts 中 log_enqueue_ns/calls 是调用 emit 的整体前台时间，footer.metrics.enqueue_ns 是 writer 内部入队区间，两者嵌套；后台 background_serialize/write/flush 分开，不能相加解释端到端增量。后台线程与前台仍争用 CPU/GIL。shadow_static/candidates/first_admission/terminal/summary 均不保存完整 prompt。
+| stage | 一次观测的测量边界 | 包含/排除 |
+|---|---|---|
+| `static_foreground` | prepare 入口→finally 中最后计时点 | 包含门禁、文本变换、长度头、临时数字构造、成功/失败/跳过处理、调用方日志字典构造及 emit 全程；按 success/failed/skipped 分组。每次实际调用prepare一条聚合观测，同文本不同请求仍各算一次。|
+| `dynamic_foreground` | sweep 入口→finally 中最后计时点 | 包含状态读取、候选提取/特征组装、批量时长预测、候选ID返回值构造、日志构造及 emit（若有）；只覆盖符合原生waiting机会条件而实际调用sweep的决策批次，不包含其他schedule轮次。|
+| `processor_consume` | consume_static 入口→finally 中最后计时点 | 包含内部键字典复制/移除、token数/n/max_tokens/三数字校验与转换、计数和 no_static/mismatch 日志的构造/入队。按 received/no_static/mismatch/failed 分组；不含此前原生SamplingParams.clone、token预处理、函数调用方门禁或之后ECR构造。|
+| `first_admission` | admit 入口→finally 中最后计时点 | 包含无静态/已准入的短路检查；实际首次准入包含标志更新、关联字段/候选成员检查、日志构造和 emit。按 admitted/no_static/already_admitted/failed 区分；不包含原生KV分配、状态机和SCHEDULED事件。|
+| `terminal` | finish 入口→finally 中最后计时点 | 包含覆盖计数、状态字段复制、结束日志构造和 emit；按 completed/failed 区分；不包含原生连接器/KV释放、完成统计计算。|
+| `log_enqueue` | Shadow.emit 入口→最后计时点 | 包含 model_sha256 字段/记录复制、RecordWriter.emit 构造与非阻塞入队、结果计数及首次失败告警；按 enqueued/dropped/failed 区分。调用方在进入emit前构造的字典不在这个子区间，已包括在外围完整阶段。|
 
-本轮仅追加 ECR 数字字段，没有给 IPC 加计时 Hook。真实编解码功能由 check_ipc.py 验证；字段编码增量、ZMQ 传输开销尚未测量。跨进程送达时差不能直接称为序列化耗时，包含排队/进程调度。
+“完整前台”指入口到该方法末尾的业务/记录区间，**包含记录构造和入队**；所有 stage 的最后一次直方图更新、最终计时指令之后的统计/函数返回，以及调用方分支/分派不包含在自身区间。最后统计更新单独计数，其成本以及新增字段引起的原生clone、Request/ECR构造增量仍属于真实扩展开销，不能把分布宣称为所有新增字节码都已逐项计量。内层log_enqueue自身聚合开销会进入外层static/dynamic/Processor/准入/结束阶段的墙钟区间。
 
-不移动 scheduled_timestamp：它仍在 schedule 较早的位置生成；旁路动态计算位于它之后，可能进入原 scheduled_ts→last_token_ts 的 inference_time 区间。前端静态阶段位于 Processor 默认 arrival_time 之前，可能不进入原引擎统计，但会进入客户端 E2E。EngineCoreOutputs 批次时间、SCHEDULED/NEW_TOKEN 与完成公式均不改。仅保证不主动改变准入规则，CPU争用仍可能改变实际墙钟、到达交错和批次轨迹。
+动态每组的 candidate_count 是本批**实际已收集**候选数，不是配置K；成功/失败可按其值分别对照，失败中途发生时它可能是已收集的部分候选数量。empty 的数值为0；interval_skip 未扫描，使用 null（未知），不能解释成队列没有有效候选。`dynamic_outcome_success/failed/empty/interval_skip` 显式计数且未发生时为0；static_outcome_success/failed/skipped 同理。success 表示预测/阶段逻辑成功，日志能否保存另看 log_dropped/log_errors 和 footer。overall 的动态分布混合规模与结果，比较规模开销应筛选 groups 的实际candidate_count及outcome，不能只比较overall。
 
-线程限制由启动环境在导入前设置并检查实际 threadpoolctl 状态，不在预测函数中修改全进程线程池。四个线程变量也会影响服务内其他 CPU 库；关闭/开启对照必须使用相同设置。不能把微基准的单 CPU taskset 套到整个服务进程。没有本次资源授权，不自行选 CPU 或申请计算节点。
+原成功静态记录的 tfidf_ns、svd_ns、text_transform_ns（前两项合并）、length_head_ns（含float64组装/后处理）和 static_compute_ns 继续保留；它们不含 emit。原动态记录的 state_read_ns、extract_assemble_ns（包含state_read）、time_head_ns 和 shadow_compute_ns 继续保留；它们也不含 emit。新 static_foreground/dynamic_foreground **包含**对应emit/记录路径；static_total_ns/shadow_total_ns 与对应完整分布的 total_ns 对齐。不能将子区间、外围区间、分项P50/P95/P99或不同时机的附加成本相加，直接解释成客户端E2E增量。
+
+日志复用 RecordWriter：每进程独立文件、1024有界队列、put_nowait、约1秒或64条flush、正常关闭最多2秒drain。写入异常/队列满计数、首次报错后抑制重复刷屏；summary 本身也可能丢失。必须检查 footer 的 dropped_records、serialization_errors、writer_errors、clean_shutdown/records_complete；缺summary或footer时分布不完整/未经确认，不能将已有样本冒充完整成功。summary 是关闭前的数值快照，排除它自身的emit及之后shutdown，writer footer仍计其入队/写出。关闭汇总不在逐请求/逐批次分布里。
+
+log_enqueue 与外围完整阶段嵌套；footer.metrics.enqueue_ns 是 writer 内部子区间，后台 background_serialize/write/flush 单独记录。后台线程仍争用CPU/GIL；不能将前台、后台和嵌套区间简单相加。日志及直方图不保存完整prompt。
+
+### IPC和端到端边界
+
+`check_ipc.py` 只验证真实ECR/原生Msgpack编解码、spawn和Request身份/数字字段的**功能正确性**，不测IPC开销。processor_consume也不是IPC耗时。新增字段引起的SamplingParams.clone、ECR/Request构造、编码字节/编解码增量、ZMQ传输与接收等尚未测量；跨进程送达时差包含排队和进程调度，不能直接命名为序列化开销。后续如测增量，需同内容有/无字段的编码/解码单独测量，并将发送到接收命名为传递延迟，不在本轮补做IPC开销实验。
+
+不移动 scheduled_timestamp：它仍在schedule较早的位置生成；动态计算、首次准入记录等位于其后，可能进入原scheduled_ts→last_token_ts的inference_time区间。前端静态位于Processor默认arrival_time之前，可能不进入原引擎统计，但进入客户端E2E；Processor字段消费位于该arrival_time之后。结束日志位于Core释放路径，也可能影响同轮输出可见时机。EngineCoreOutputs批次时间、SCHEDULED/NEW_TOKEN和完成公式均不改。局部区间不能覆盖完整服务内增量，真实端到端影响只能通过**完全同配置的shadow off/on**比较客户端原生延迟和吞吐评估。
+
+线程限制在启动导入前设置/检查，不在预测函数中反复修改全进程线程池；四个变量也会影响服务内其他CPU库。off/on必须保持同线程和服务/客户端配置，不能把微基准单CPU taskset套到整个服务进程。旁路仍不排序、不主动改变准入规则，CPU争用可能改变墙钟交错和实际批次轨迹。
 
 ## 与旧采集器的组合
 
@@ -139,8 +161,11 @@ VLLM_USE_V1=1 "$R1_SERVICEPY" -m vllm.entrypoints.openai.api_server \
   --host 127.0.0.1 --port 8011 \
   --disable-log-requests --enable-chunked-prefill \
   --enforce-eager --tensor-parallel-size 1 --max-num-seqs 8 \
+  --max-model-len 8192 --max-num-batched-tokens 8192 \
   > "$R1_ACCEPT/server.log" 2>&1
 ```
+
+**max-num-seqs=8 是首轮等待候选覆盖验收设置**，配合既有请求率/并发检查waiting机会，不是正式部署最优值，也不代表本轮已完成正式开销实验。off/on两组服务命令均显式保留 `--max-model-len 8192 --max-num-batched-tokens 8192`；所有服务与客户端的行为参数必须完全相同（模型、上下文/批次预算、max-num-seqs、chunked prefill、请求数/seed/来源/顺序、请求率、并发、生成上限/temperature、线程及采集开关等）。只改变shadow开关及为防覆盖而更换的run_id/输出名称。
 
 同节点另一终端先 `source /本次实际输出目录/paths.sh`，再 `cd "$R1_REPO"`；清除 PYTHONPATH/PYTHONHOME 并设置与上面相同的四个线程变量及 PYTHONNOUSERSITE/PYTHONDONTWRITEBYTECODE。路径文件位于刚打印的 R1_ACCEPT，不是字面占位符。以下三个变量不要求 shadow，但客户端 COLLECT 用于关联样本；输出名称存在时必须换新：
 
@@ -183,7 +208,9 @@ printf '回传：%s\n' "$R1_DELIVERY"
 
 本地现有 Python3.12，仅使用标准库及已有 NumPy；不安装包、不读取训练/测试数据、不加载真实 B 模型。轻量测试执行实际 Completion、Processor、Request、Scheduler 方法（AST加载，资源 stub），比较运行基线与 shadow开/关调度输出、KV调用、事件/状态和队列，覆盖静态次数/空白、字段门禁、伪造值、失败回退、首次/恢复/取消、共享数值快照和有界扫描。已有采集器及 mixed 回归继续执行。采集器原“整个IPC文件不变”断言仅调整为保护原有字段，显式允许新增尾部可选字段。
 
-本轮本地结果：shadow 21项正常模式通过、21项 `-O` 通过；采集器34项通过（含单类 mixed 保护）；完整 mixed 测试因现有解释器缺 pyarrow，在导入阶段受阻，未安装依赖或声称通过。Python3.10 语法静态检查、五个 Bash 块语法检查与两个验证 CLI 的 --help 检查通过。完整日志保存在仓库外，不随源码推送。
+本次追加修正的本地结果：shadow 28项正常模式通过、28项 `-O` 通过；采集器34项通过（含单类 mixed 保护）。新增测试用可控时钟验证完整区间包含emit、成功/失败/空候选/间隔跳过各自计数、按实际候选规模分组、丢弃日志仍聚合、无递归emit、桶边界/合并/固定存储与缺失分位数。真实原生调度输出与队列/KV调用不变的既有测试继续运行。Python3.10语法、五个Bash块语法及git diff检查通过；未执行真实服务。
+
+前轮两个验证CLI的 --help 已通过；本轮未修改这些程序。完整mixed测试在前轮因现有解释器缺pyarrow而导入受阻，本轮未安装依赖或声称其通过。完整日志保存在仓库外，不随源码推送。
 
 ```bash
 python -B tests/benchmarks/test_r1_shadow.py -v

@@ -8,6 +8,7 @@ these local tests never install packages, load an LLM or initialize CUDA.
 import ast
 import copy
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -83,6 +84,7 @@ class ShadowTests(unittest.TestCase):
     def test_disabled_no_import_model_writer_or_id(self):
         with patch.dict(os.environ, {"VLLM_R1_SHADOW": "0"}, clear=True), \
              patch.object(S, "Predictor", side_effect=AssertionError("model")), \
+             patch.object(S, "DurationHistogram", side_effect=AssertionError("histogram")), \
              patch.object(native.C, "RecordWriter", side_effect=AssertionError("writer")):
             before = set(sys.modules)
             self.assertIsNone(S.create_shadow(None, "frontend"))
@@ -478,6 +480,208 @@ class ShadowTests(unittest.TestCase):
         core.model_executor = NS(shutdown=Mock())
         core.shutdown()
         self.assertFalse(shadow.writer._thread.is_alive())
+
+    def timed_shadow(self, every=1):
+        clock = NS(now=1000)
+        def advance(ns):
+            clock.now += ns
+        clock.advance = advance
+        records = []
+        def emit(kind, values):
+            advance(40)
+            records.append(dict(record_type=kind, **copy.deepcopy(values)))
+            return True
+        writer = NS(instance_id="timing-fixture", emit=emit, close=lambda: True)
+        predictor = FakePredictor()
+        original_static, original_assemble, original_dynamic = (
+            predictor.static, predictor.assemble, predictor.dynamic)
+        fail = [False]
+        def static(*args):
+            advance(100)
+            if fail[0]:
+                raise RuntimeError("static fixture failure")
+            return original_static(*args)
+        def assemble(*args):
+            advance(20)
+            return original_assemble(*args)
+        def dynamic(*args):
+            advance(30)
+            if fail[0]:
+                raise RuntimeError("dynamic fixture failure")
+            return original_dynamic(*args)
+        predictor.static, predictor.assemble, predictor.dynamic = static, assemble, dynamic
+        config = S.ShadowConfig(self.directory / "unused", "timing-test",
+                                self.directory, 2, 4, every)
+        shadow = S.Shadow(config, predictor, writer)
+        class KV:
+            @property
+            def usage(self):
+                advance(5)
+                return .25
+        return shadow, clock, records, fail, KV()
+
+    def timing_group(self, shadow, stage, outcome, candidate_count=None):
+        groups = [g for g in shadow.duration_report()["groups"]
+                  if (g["stage"], g["outcome"], g["candidate_count"])
+                  == (stage, outcome, candidate_count)]
+        self.assertEqual(len(groups), 1)
+        return groups[0]
+
+    def test_fixed_histogram_quantile_bounds_merge_and_storage(self):
+        histogram, other = S.DurationHistogram(), S.DurationHistogram()
+        values = list(range(1001)) + [(1 << 32) - 1, 1 << 63, (1 << 64) - 1,
+                                     1 << 64, (1 << 64) + 900]
+        for i, value in enumerate(values):
+            (histogram if i % 2 else other).observe(value)
+        histogram.merge(other)
+        result = histogram.report()
+        self.assertEqual(result["n"], len(values))
+        self.assertEqual(result["total_ns"], sum(values))
+        self.assertEqual(sum(b["count"] for b in result["bins"]), len(values))
+        ordered = sorted(values)
+        for percentile in (50, 95, 99):
+            actual = ordered[(len(values) * percentile + 99) // 100 - 1]
+            low, high = result[f"p{percentile}_bounds_ns"]
+            self.assertLessEqual(low, actual)
+            self.assertGreaterEqual(high, actual)
+            self.assertEqual(result[f"p{percentile}_upper_ns"], high)
+        for _ in range(10000):
+            histogram.observe(100)
+        self.assertEqual(len(histogram.bins), 497)
+        self.assertEqual(histogram.bins.itemsize * len(histogram.bins), 3976)
+        self.assertEqual(histogram.bins[-1], 2)
+        with self.assertRaises(ValueError):
+            histogram.observe(-1)
+        with self.assertRaises(ValueError):
+            histogram.observe(1.5)
+
+    def test_empty_histogram_reports_missing_quantiles_not_zero(self):
+        result = S.DurationHistogram().report()
+        self.assertEqual(result["n"], 0)
+        self.assertIsNone(result["p50_upper_ns"])
+        self.assertIsNone(result["p95_bounds_ns"])
+        self.assertIsNone(result["p99_upper_ns"])
+        shadow, _, _, _, _ = self.timed_shadow()
+        self.assertEqual(shadow.duration_report()["groups"], [])
+        self.assertEqual(shadow.duration_report()["overall"], {})
+        for outcome in ("success", "failed", "empty", "interval_skip"):
+            self.assertEqual(shadow.counts["dynamic_outcome_" + outcome], 0)
+
+    def test_full_static_distribution_includes_enqueue_and_all_outcomes(self):
+        shadow, clock, records, fail, _ = self.timed_shadow()
+        req = completion_request()
+        normalized = {"prompt": req.prompt, "prompt_token_ids": [1, 2]}
+        with patch.object(S.time, "perf_counter_ns", side_effect=lambda: clock.now):
+            shadow.prepare(req, native.params(max_tokens=2048), normalized,
+                           {"prompt_token_ids": [1, 2]}, "ok")
+            fail[0] = True
+            shadow.prepare(req, native.params(max_tokens=2048), normalized,
+                           {"prompt_token_ids": [1, 2]}, "failed")
+            shadow.prepare(completion_request(n=2), native.params(max_tokens=2048),
+                           {}, {}, "skipped")
+            for outcome, duration in (("success", 140), ("failed", 140), ("skipped", 40)):
+                group = self.timing_group(shadow, "static_foreground", outcome)
+                self.assertEqual((group["n"], group["total_ns"]), (1, duration))
+                self.assertEqual(group["p99_upper_ns"], duration)
+            self.assertEqual(records[0]["static_compute_ns"], 100)
+            overall = shadow.duration_report()["overall"]["static_foreground"]
+            self.assertEqual((overall["n"], overall["total_ns"]), (3, 320))
+            self.assertEqual(shadow.counts["static_total_ns"], 320)
+            self.assertEqual(len(records), 3)  # No extra timing emit/recursion.
+            shadow.close()
+        summary = records[-1]
+        self.assertEqual(summary["record_type"], "shadow_summary")
+        self.assertEqual(len(records), 4)
+        distribution = summary["foreground_distributions"]
+        self.assertEqual(distribution["overall"]["log_enqueue"]["n"], 3)
+        # Summary is a frozen snapshot: its own enqueue is excluded.
+        self.assertEqual(shadow.duration_report()["overall"]["log_enqueue"]["n"], 4)
+        self.assertEqual(distribution["overall"]["log_enqueue"]["n"], 3)
+
+    def test_dynamic_full_distributions_by_actual_count_and_outcome(self):
+        shadow, clock, records, fail, kv = self.timed_shadow(every=2)
+        a, b = request("a"), request("b")
+        with patch.object(S.time, "perf_counter_ns", side_effect=lambda: clock.now):
+            shadow.sweep([a, b], [], kv, 10, 1.)  # success, actual count 2
+            shadow.sweep([a], [], kv, 10, 1.)  # interval, unknown count
+            shadow.sweep([request("missing", lengths=None)], [], kv, 10, 1.)  # empty
+            shadow.sweep([a], [], kv, 10, 1.)  # interval
+            fail[0] = True
+            shadow.sweep([a], [], kv, 10, 1.)  # failed, actual selected count 1
+            shadow.sweep([a], [], kv, 10, 1.)  # interval
+            fail[0] = False
+            shadow.sweep([a], [], kv, 10, 1.)  # success, actual count 1
+            for outcome, count, n, total in (("success", 2, 1, 95), ("success", 1, 1, 95),
+                    ("failed", 1, 1, 95), ("empty", 0, 1, 5), ("interval_skip", None, 3, 15)):
+                group = self.timing_group(shadow, "dynamic_foreground", outcome, count)
+                self.assertEqual((group["n"], group["total_ns"]), (n, total))
+            self.assertEqual(records[0]["shadow_compute_ns"], 55)
+            self.assertEqual(shadow.counts["dynamic_outcome_success"], 2)
+            self.assertEqual(shadow.counts["dynamic_outcome_failed"], 1)
+            self.assertEqual(shadow.counts["dynamic_outcome_empty"], 1)
+            self.assertEqual(shadow.counts["dynamic_outcome_interval_skip"], 3)
+            overall = shadow.duration_report()["overall"]["dynamic_foreground"]
+            self.assertEqual((overall["n"], overall["total_ns"]), (7, 305))
+            self.assertEqual(shadow.counts["shadow_total_ns"], 305)
+            self.assertEqual(len(records), 3)
+            shadow.close()
+        self.assertEqual(records[-1]["foreground_distributions"]["overall"]
+                         ["dynamic_foreground"]["n"], 7)
+
+    def test_processor_admission_terminal_scopes_include_their_logs(self):
+        shadow, clock, _, _, _ = self.timed_shadow()
+        envelope = S.StaticEnvelope(2, 2048, (1., 2., 3.))
+        with patch.object(S.time, "perf_counter_ns", side_effect=lambda: clock.now):
+            S.consume_static(native.params(max_tokens=2048,
+                extra_args={S.INTERNAL_KEY: envelope}), 2, shadow, "ok")
+            S.consume_static(native.params(max_tokens=2048,
+                extra_args={S.INTERNAL_KEY: {"forged": True}}), 2, shadow, "bad")
+            S.consume_static(native.params(max_tokens=2048), 2, shadow, "missing")
+            for outcome, elapsed in (("received", 0), ("mismatch", 40), ("no_static", 40)):
+                self.assertEqual(self.timing_group(shadow, "processor_consume", outcome)
+                                 ["total_ns"], elapsed)
+            r = request("first")
+            shadow.admit(r, None)
+            shadow.admit(r, None)
+            shadow.admit(request("no-static", lengths=None), None)
+            self.assertEqual(self.timing_group(shadow, "first_admission", "admitted")
+                             ["total_ns"], 40)
+            self.assertEqual(self.timing_group(shadow, "first_admission", "already_admitted")
+                             ["total_ns"], 0)
+            r.status = native.N["RequestStatus"].FINISHED_ABORTED
+            shadow.finish(r)
+            self.assertEqual(self.timing_group(shadow, "terminal", "completed")["total_ns"], 40)
+            shadow.close()
+
+    def test_dropped_log_does_not_remove_foreground_observation(self):
+        shadow, clock, records, _, _ = self.timed_shadow()
+        original_emit = shadow.writer.emit
+        def drop(*args):
+            clock.advance(40)
+            return False
+        shadow.writer.emit = drop
+        req = completion_request()
+        with patch.object(S.time, "perf_counter_ns", side_effect=lambda: clock.now):
+            shadow.prepare(req, native.params(max_tokens=2048),
+                {"prompt": req.prompt, "prompt_token_ids": [1]},
+                {"prompt_token_ids": [1]}, "dropped")
+            self.assertEqual(records, [])
+            self.assertEqual(self.timing_group(shadow, "static_foreground", "success")["n"], 1)
+            self.assertEqual(self.timing_group(shadow, "log_enqueue", "dropped")["total_ns"], 40)
+            self.assertEqual(shadow.counts["log_dropped"], 1)
+            shadow.writer.emit = original_emit
+            shadow.close()
+        self.assertEqual(records[0]["foreground_distributions"]["overall"]
+                         ["static_foreground"]["n"], 1)
+
+    def test_readme_service_preserves_capacity_parameters(self):
+        text = (ROOT / "tools/r1_shadow/README.md").read_text("utf-8")
+        blocks = [b for b in re.findall(r"```bash\n(.*?)```", text, re.S)
+                  if "vllm.entrypoints.openai.api_server" in b]
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("--max-model-len 8192", blocks[0])
+        self.assertIn("--max-num-batched-tokens 8192", blocks[0])
+        self.assertIn("--max-num-seqs 8", blocks[0])
 
 
 if __name__ == "__main__":

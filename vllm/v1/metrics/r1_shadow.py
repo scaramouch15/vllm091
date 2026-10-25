@@ -15,6 +15,7 @@ import platform
 import re
 import sys
 import time
+from array import array
 from collections import Counter
 from dataclasses import dataclass
 from itertools import islice
@@ -32,6 +33,80 @@ logger = logging.getLogger(__name__)
 def require(condition, message):
     if not condition:
         raise ValueError("R1 shadow: " + message)
+
+
+class DurationHistogram:
+    """Fixed 497 uint64 counters, O(1) update, no raw samples or RNG.
+
+    0..15 ns are exact; larger bins have eight subdivisions per power of two.
+    The last bin handles durations >= 2**64 ns without growing the array.
+    Quantiles are nearest-rank bucket bounds, computed only at shutdown.
+    """
+    NUM_BINS = 497
+
+    def __init__(self):
+        self.bins = array("Q", [0]) * self.NUM_BINS
+        self.n = self.total_ns = 0
+        self.min_ns = self.max_ns = None
+
+    def observe(self, duration_ns):
+        if type(duration_ns) is not int or duration_ns < 0:
+            raise ValueError("duration must be nonnegative integer nanoseconds")
+        if duration_ns >= 1 << 64:
+            index = self.NUM_BINS - 1
+        else:
+            shift = max(0, duration_ns.bit_length() - 4)
+            index = (duration_ns if shift == 0 else
+                     16 + (shift - 1) * 8 + (duration_ns >> shift) - 8)
+        self.bins[index] += 1
+        self.n += 1
+        self.total_ns += duration_ns
+        self.min_ns = duration_ns if self.min_ns is None else min(self.min_ns, duration_ns)
+        self.max_ns = duration_ns if self.max_ns is None else max(self.max_ns, duration_ns)
+
+    def report(self):
+        occupied = []
+        for index, count in enumerate(self.bins):
+            if not count:
+                continue
+            if index < 16:
+                low = high = index
+            elif index == self.NUM_BINS - 1:
+                low, high = 1 << 64, self.max_ns
+            else:
+                shift = 1 + (index - 16) // 8
+                low = (8 + (index - 16) % 8) << shift
+                high = low + (1 << shift) - 1
+            occupied.append({"index": index, "count": count,
+                             "lower_ns": max(low, self.min_ns),
+                             "upper_ns": min(high, self.max_ns)})
+        result = {"n": self.n, "total_ns": self.total_ns,
+                  "min_ns": self.min_ns, "max_ns": self.max_ns,
+                  "bins": occupied}
+        for percentile in (50, 95, 99):
+            bounds = None
+            if self.n:
+                rank = (self.n * percentile + 99) // 100
+                cumulative = 0
+                for bucket in occupied:
+                    cumulative += bucket["count"]
+                    if cumulative >= rank:
+                        bounds = [bucket["lower_ns"], bucket["upper_ns"]]
+                        break
+            result[f"p{percentile}_bounds_ns"] = bounds
+            result[f"p{percentile}_upper_ns"] = bounds[1] if bounds else None
+        return result
+
+    def merge(self, other):
+        """Cold-path merge for overall stage reports; no repeated hot updates."""
+        if not other.n:
+            return
+        for index, count in enumerate(other.bins):
+            self.bins[index] += count
+        self.total_ns += other.total_ns
+        self.min_ns = other.min_ns if not self.n else min(self.min_ns, other.min_ns)
+        self.max_ns = other.max_ns if not self.n else max(self.max_ns, other.max_ns)
+        self.n += other.n
 
 
 @dataclass(frozen=True)
@@ -84,26 +159,36 @@ def consume_static(params, prompt_tokens, shadow, request_id=None):
     JSON clients cannot construct StaticEnvelope; CompletionRequest only maps
     kv_transfer_params into extra_args. Even a forged dict is discarded.
     """
-    if not params.extra_args or INTERNAL_KEY not in params.extra_args:
-        if shadow is not None:
+    start = time.perf_counter_ns() if shadow is not None else None
+    outcome = "failed"
+    try:
+        if not params.extra_args or INTERNAL_KEY not in params.extra_args:
+            outcome = "no_static"
+            if shadow is None:
+                return None
             shadow.counts["processor_without_static"] += 1
             shadow.emit("shadow_processor_skip", {"engine_request_id": request_id,
                                                   "reason": "no_static"})
-        return None
-    params.extra_args = dict(params.extra_args)
-    value = params.extra_args.pop(INTERNAL_KEY)
-    if shadow is None:
-        return None
-    if (type(value) is not StaticEnvelope or params.n != 1
-            or value.prompt_tokens != prompt_tokens
-            or value.max_tokens != params.max_tokens or params.max_tokens != 2048
-            or not valid_lengths(value.lengths)):
-        shadow.counts["processor_static_mismatch"] += 1
-        shadow.emit("shadow_processor_skip", {"engine_request_id": request_id,
-                                              "reason": "static_mismatch"})
-        return None
-    shadow.counts["processor_static_received"] += 1
-    return tuple(float(x) for x in value.lengths)
+            return None
+        params.extra_args = dict(params.extra_args)
+        value = params.extra_args.pop(INTERNAL_KEY)
+        if shadow is None:
+            return None
+        if (type(value) is not StaticEnvelope or params.n != 1
+                or value.prompt_tokens != prompt_tokens
+                or value.max_tokens != params.max_tokens or params.max_tokens != 2048
+                or not valid_lengths(value.lengths)):
+            outcome = "mismatch"
+            shadow.counts["processor_static_mismatch"] += 1
+            shadow.emit("shadow_processor_skip", {"engine_request_id": request_id,
+                                                  "reason": "static_mismatch"})
+            return None
+        outcome = "received"
+        shadow.counts["processor_static_received"] += 1
+        return tuple(float(x) for x in value.lengths)
+    finally:
+        if shadow is not None:
+            shadow.observe_elapsed("processor_consume", start, outcome)
 
 
 def validate_service(config):
@@ -215,28 +300,69 @@ class Shadow:
     def __init__(self, config, predictor, writer):
         self.config, self.predictor, self.writer = config, predictor, writer
         self.counts = Counter()
+        for outcome in ("success", "failed", "empty", "interval_skip"):
+            self.counts["dynamic_outcome_" + outcome] = 0
+        for outcome in ("success", "failed", "skipped"):
+            self.counts["static_outcome_" + outcome] = 0
+        self.duration_histograms = {}
         self.batch = 0
         self.closed = False
+
+    def observe_elapsed(self, stage, start, outcome, candidate_count=None,
+                        total_counter=None):
+        # Deliberately no emit/observe recursion. The measurement ends here,
+        # before its own histogram bookkeeping, which is separately counted.
+        finished = time.perf_counter_ns()
+        elapsed = finished - start
+        key = (stage, outcome, candidate_count)
+        histogram = self.duration_histograms.get(key)
+        if histogram is None:
+            histogram = self.duration_histograms[key] = DurationHistogram()
+        histogram.observe(elapsed)
+        if total_counter is not None:
+            self.counts[total_counter] += elapsed
+        self.counts["timing_bookkeeping_calls"] += 1
+        self.counts["timing_bookkeeping_ns"] += time.perf_counter_ns() - finished
+
+    def duration_report(self):
+        overall = {}
+        for (stage, _, _), histogram in self.duration_histograms.items():
+            if stage not in overall:
+                overall[stage] = DurationHistogram()
+            overall[stage].merge(histogram)
+        return {"schema_version": 1, "unit": "ns",
+                "method": "nearest_rank_log_bucket_bounds_4_significant_bits",
+                "bins_per_group": DurationHistogram.NUM_BINS,
+                "overall": {stage: histogram.report()
+                            for stage, histogram in overall.items()},
+                "groups": [dict(stage=stage, outcome=outcome,
+                                candidate_count=count, **histogram.report())
+                           for (stage, outcome, count), histogram
+                           in self.duration_histograms.items()]}
 
     def emit(self, kind, values):
         # No prompt, exception message or mutable Request is handed to writer.
         start = time.perf_counter_ns()
+        outcome = "failed"
         try:
             ok = self.writer.emit(kind, dict(values, model_sha256=MODEL_SHA256))
             self.counts["log_enqueued" if ok else "log_dropped"] += 1
+            outcome = "enqueued" if ok else "dropped"
         except Exception as exc:
             self.counts["log_errors"] += 1
             if self.counts["log_errors"] == 1:
                 logger.error("R1 shadow log enqueue failed (%s); records incomplete; "
                              "further failures are counted", type(exc).__name__)
         self.counts["log_enqueue_calls"] += 1
-        self.counts["log_enqueue_ns"] += time.perf_counter_ns() - start
+        self.observe_elapsed("log_enqueue", start, outcome,
+                             total_counter="log_enqueue_ns")
 
     def prepare(self, request, params, normalized, engine_prompt, request_id,
                 lora=None, adapter=None):
         """One call per Completion prompt, before AsyncLLM / arrival_time."""
         start = time.perf_counter_ns()
         self.counts["completion_prompts"] += 1
+        outcome = "failed"
         try:
             if getattr(params, "extra_args", None):
                 params.extra_args = dict(params.extra_args)
@@ -263,6 +389,7 @@ class Shadow:
                   or normalized.get("prompt_token_ids") != engine_prompt["prompt_token_ids"]):
                 reason = "normalized_input_mismatch"
             if reason:
+                outcome = "skipped"
                 self.counts["skip_" + reason] += 1
                 self.emit("shadow_static_skip", {"engine_request_id": request_id,
                                                  "reason": reason})
@@ -276,18 +403,22 @@ class Shadow:
             params.extra_args.pop(INTERNAL_KEY, None)
             params.extra_args[INTERNAL_KEY] = StaticEnvelope(tokens, 2048, lengths)
             self.counts["static_success"] += 1
+            outcome = "success"
             self.emit("shadow_static", {"engine_request_id": request_id,
                 "prompt_tokens": tokens, "max_tokens": 2048,
                 "length_quantiles": lengths, **timings,
                 "static_compute_ns": time.perf_counter_ns() - start})
         except Exception as exc:
+            outcome = "failed"
             if getattr(params, "extra_args", None):
                 params.extra_args.pop(INTERNAL_KEY, None)
             self.counts["static_errors"] += 1
             self.emit("shadow_static_error", {"engine_request_id": request_id,
                                               "error_type": type(exc).__name__})
         finally:
-            self.counts["static_total_ns"] += time.perf_counter_ns() - start
+            self.counts["static_outcome_" + outcome] += 1
+            self.observe_elapsed("static_foreground", start, outcome,
+                                 total_counter="static_total_ns")
 
     def sweep(self, waiting, running, kv_manager, token_budget,
               scheduled_timestamp, decision_batch_id=None):
@@ -297,6 +428,7 @@ class Shadow:
         self.counts["waiting_opportunities"] += 1
         snapshot = None
         candidates = []
+        outcome = "failed"
         try:
             running_count, kv_usage = len(running), float(kv_manager.usage)
             snapshot = {"decision_batch_id": decision_batch_id or
@@ -309,6 +441,7 @@ class Shadow:
                     "invalid KV usage")
             if (self.batch - 1) % self.config.every:
                 self.counts["frequency_skips"] += 1
+                outcome = "interval_skip"
                 return snapshot, ()
             for r in islice(waiting, self.config.scan_limit):
                 self.counts["scanned_opportunities"] += 1
@@ -329,6 +462,7 @@ class Shadow:
                     break
             if not candidates:
                 self.counts["empty_sweeps"] += 1
+                outcome = "empty"
                 return snapshot, ()
             matrix = self.predictor.assemble(candidates, running_count, kv_usage)
             assembled = time.perf_counter_ns()
@@ -349,6 +483,7 @@ class Shadow:
                 r.r1_shadow_predicted = True
             self.counts["dynamic_success"] += 1
             self.counts["candidate_predictions"] += len(candidates)
+            outcome = "success"
             self.emit("shadow_candidates", {"snapshot": snapshot,
                 "candidate_count": len(candidates), "candidates": records,
                 "extract_assemble_ns": assembled - start,
@@ -357,36 +492,60 @@ class Shadow:
                 "shadow_compute_ns": time.perf_counter_ns() - start})
             return snapshot, tuple(r.request_id for r in candidates)
         except Exception as exc:
+            outcome = "failed"
             self.counts["dynamic_errors"] += 1
             self.emit("shadow_dynamic_error", {"snapshot": snapshot,
                 "candidate_count": len(candidates), "error_type": type(exc).__name__})
             return snapshot, ()
         finally:
-            self.counts["shadow_total_ns"] += time.perf_counter_ns() - start
+            self.counts["dynamic_outcome_" + outcome] += 1
+            # An interval skip does not inspect candidates: None means unknown,
+            # rather than falsely declaring that the waiting cohort was empty.
+            count = None if outcome == "interval_skip" else len(candidates)
+            self.observe_elapsed("dynamic_foreground", start, outcome, count,
+                                 total_counter="shadow_total_ns")
 
     def admit(self, request, decision):
-        if getattr(request, "r1_shadow_lengths", None) is None:
-            return
-        if getattr(request, "r1_shadow_admitted", False):
-            return
-        request.r1_shadow_admitted = True
-        self.counts["first_admissions"] += 1
-        snapshot, ids = decision if decision is not None else (None, ())
-        self.emit("shadow_first_admission", {"engine_request_id": request.request_id,
-            "snapshot": snapshot, "predicted_in_this_batch": request.request_id in ids})
+        start = time.perf_counter_ns()
+        outcome = "failed"
+        try:
+            if getattr(request, "r1_shadow_lengths", None) is None:
+                outcome = "no_static"
+                return
+            if getattr(request, "r1_shadow_admitted", False):
+                outcome = "already_admitted"
+                return
+            request.r1_shadow_admitted = True
+            self.counts["first_admissions"] += 1
+            snapshot, ids = decision if decision is not None else (None, ())
+            self.emit("shadow_first_admission", {"engine_request_id": request.request_id,
+                "snapshot": snapshot, "predicted_in_this_batch": request.request_id in ids})
+            outcome = "admitted"
+        finally:
+            self.observe_elapsed("first_admission", start, outcome)
 
     def finish(self, request):
-        self.counts["terminal_requests"] += 1
-        self.emit("shadow_terminal", {"engine_request_id": request.request_id,
-            "had_static": getattr(request, "r1_shadow_lengths", None) is not None,
-            "was_candidate": getattr(request, "r1_shadow_predicted", False),
-            "was_admitted": getattr(request, "r1_shadow_admitted", False),
-            "status": request.status.name})
+        start = time.perf_counter_ns()
+        outcome = "failed"
+        try:
+            self.counts["terminal_requests"] += 1
+            self.emit("shadow_terminal", {"engine_request_id": request.request_id,
+                "had_static": getattr(request, "r1_shadow_lengths", None) is not None,
+                "was_candidate": getattr(request, "r1_shadow_predicted", False),
+                "was_admitted": getattr(request, "r1_shadow_admitted", False),
+                "status": request.status.name})
+            outcome = "completed"
+        finally:
+            self.observe_elapsed("terminal", start, outcome)
 
     def close(self):
         if not self.closed:
             self.closed = True
-            self.emit("shadow_summary", {"counts": dict(self.counts)})
+            start = time.perf_counter_ns()
+            values = {"counts": dict(self.counts),
+                      "foreground_distributions": self.duration_report()}
+            values["summary_build_ns"] = time.perf_counter_ns() - start
+            self.emit("shadow_summary", values)
         complete = self.writer.close()
         return complete and not self.counts["log_errors"]
 
