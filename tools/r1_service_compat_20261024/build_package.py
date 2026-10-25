@@ -12,7 +12,7 @@ PACKAGE_ROOT='r1_service_compat_20261024'
 FILES=(
     '.gitignore','README.md','review_report_20261025.md','TESTING.md',
     'inspect_service.py','environment_probe.py','cpu_checks.py',
-    'clone_validate.py','pack_checks.py','test_checks.py','build_package.py',
+    'clone_validate.py','pack_checks.py','test_checks.py','test_regressions.py','build_package.py',
     'predictor_requirements.txt','source_baseline.json',
 )
 

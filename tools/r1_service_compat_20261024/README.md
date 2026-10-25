@@ -53,8 +53,8 @@ import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1]).resolve()
 for name,digest in json.loads((root/'files_sha256.json').read_text()).items():
     path=(root/name).resolve()
-    assert path.is_relative_to(root)
-    assert hashlib.sha256(path.read_bytes()).hexdigest()==digest,name
+    if not path.is_relative_to(root):raise RuntimeError('Invalid package path: '+name)
+    if hashlib.sha256(path.read_bytes()).hexdigest()!=digest:raise RuntimeError('Package checksum mismatch: '+name)
 print('Tool package verified')
 print('Source commit:',json.loads((root/'SOURCE_COMMIT.json').read_text())['source_commit'])
 PY
@@ -77,7 +77,9 @@ PY
 )
 ```
 
-结果包含 `native_environment.json`、`isolated_environment.json`、各自 pip check/freeze/config、dry-run/report、实际 import 身份与源码核对。对安装来源的 URL 凭据/query 脱敏。检查目录是新的，原环境只被读取，没有 pip install 正式执行。
+结果包含 `native_environment.json`、`isolated_environment.json`、各自 pip check/freeze/config、dry-run/report、实际 import 身份与源码核对。`imported_sources` 使用 schema_version=2：`vllm/*` 核对实际导入的包，`benchmarks/*` 核对显式 service_repo，各自报告 checked/skipped/mismatched；缺根目录、缺文件或不一致不能通过。旧版缺 benchmark 覆盖的 assessment 必须重新执行检查，不能直接用于本版克隆。
+
+安装来源的 URL 凭据/query 脱敏。检查目录是新的，原环境只被读取，没有 pip install 正式执行。`cpu_checks.py` 的关键身份、版本、CUDA、哈希、样本和预测检查使用显式异常，`-O`/PYTHONOPTIMIZE 不会移除这些门禁；失败输出 passed=false，预测失败不输出成功信息。
 
 若 `clone_install_eligible=false`，先打包第 3 步回传，**不执行第 2 步**。若 Python/NumPy/SciPy 不符、要替换既有包、出现 torch/CUDA/其他额外依赖、原环境已有冲突、user site 导入差异、pip 功能不足或源码不同，报告会列出 HOLD 原因。不升级 pip、不自动修复冲突。
 
@@ -131,9 +133,19 @@ PYTHONDONTWRITEBYTECODE=1 "$R1_TOOLPY" -B "$R1_KIT/clone_validate.py" \
 
 此流程先核对源库存未变化，再以 `--copy --offline --clone` 创建服务环境副本。副本只允许安装已解析的缺失固定依赖；先下载固定 wheel，再从本地 wheelhouse 完整解析，不用 `--no-deps`。所有既有包（包括 torch、vLLM、CUDA 包）必须保持版本不变，超出计划立即停止。副本 pip 配置仅在子进程内禁用隐含目标，并显式指向副本 prefix；不会修改原环境或全局 pip 配置。
 
+克隆完成后、任何 pip 下载/安装之前，`clone_identity.json` 核对 sys.prefix、sys.executable（含解析后的路径）、实际导入 pip 的文件、pip 元数据位置/版本，以及 purelib/platlib/scripts/data/headers 安装 scheme 都指向副本。身份或目标不符即停止后续 pip 操作；不仅比较包版本。安装后的实际模块路径检查继续保留。
+
 两种导入顺序分别在新进程验证，第三个 CPU 进程加载 B 模型对照 1440 条验证预测。没有单 CPU taskset 套用到服务，也没有启动服务进程。CPU 验证子进程固定数值库线程、记录实际线程池，阻止 lazy CUDA 初始化。该结论仍不能替代 GPU/真实服务并发验证。
 
 若独立副本失败，保留 `failure.json`、命令与日志；不要反复在原环境试装包。若 Conda 离线缓存不足或空间超出上限，停止报告，不自动换安装方式或依赖版本。
+
+结果目录建立后，成功或可捕获失败都尝试记录 `source_after.json` 和 `source_after_status.json`。结束核查比较前后包库存、prefix、解释器和所选模块来源，状态为 unchanged/changed/unknown；unknown 时 unchanged 和 original_package_versions_unchanged 为 null，不写 true。原始错误保存在 failure.json，结束核查的第二个错误不会覆盖它；结束核查不成功时 completion.complete=false。unchanged 只表示记录的快照字段一致，不表示整个环境文件系统逐字节未变。
+
+## 旁路验收设计状态
+
+本轮只审查工具与接入方案。未来首轮采用客户端固定验收请求，客户端保存样本与 request_id 关联，离线按 request_id 对照静态长度预测；时长预测还须带对应 sweep/state 数值，在相同状态下重算后比较。服务端只做输入形式、实际 token 数、有效 max_tokens、模型配置等必要检查；不按请求文本哈希做成员筛选，也不为该筛选增加跳过原因或计时。
+
+SamplingParams.extra_args 仍是待实施的前端临时数字传递方案；候选上限与采样频率仅是验收建议。未实现预测 Hook、队列重排或正式在线开销实验，现有 CPU 微基准不替代服务内验收。
 
 ## 3. 打包回传（成功/失败均可）
 
@@ -167,6 +179,7 @@ PYTHONDONTWRITEBYTECODE=1 "$R1_TOOLPY" -B "$R1_KIT/pack_checks.py" \
 | cpu_checks.py | 一次性 CPU 导入顺序与 B 模型验证，无 LLM 引擎 |
 | pack_checks.py | 打包工作目录日志/工具，排除外部大型环境 |
 | test_checks.py | 本地标准库门禁、语法、来源与 CUDA 保护合成检查 |
+| test_regressions.py | 优化模式失败、克隆身份门禁、结束检查及 benchmark 来源回归 |
 | source_baseline.json | 23 个实际审查源码文件的哈希、函数行号与 Git 状态 |
 | predictor_requirements.txt | 五个固定预测依赖约束，不包含 vLLM 或 torch 安装指令 |
-| build_package.py | 从指定已提交源码生成白名单工具包及源码 commit 标识 |
+| build_package.py | 从指定已提交源码文件清单生成工具包及源码 commit 标识 |

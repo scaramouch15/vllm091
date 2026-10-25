@@ -74,22 +74,44 @@ def classify(snapshot,plan,pip_ok=True):
     return dict(target=TARGET,changes=changes,hold_reasons=reasons,additive_plan_only=not reasons)
 
 
-def source_check(identity):
+def source_check(identity,service_repo=None):
     expected=load(ROOT/'source_baseline.json')
     module=identity.get('modules',{}).get('vllm',{})
-    if not module.get('file'):return dict(passed=False,error='vllm import identity unavailable')
-    root=Path(module['file']).resolve().parent
-    records={}
+    root=Path(module['file']).resolve().parent if module.get('file') else None
+    repo=Path(service_repo).resolve() if service_repo is not None else None
+    records={};checked=[];skipped=[];mismatched=[]
     for name,wanted in expected['sources'].items():
-        path=root/Path(name).relative_to('vllm') if name.startswith('vllm/') else None
-        if path is None:continue
-        if not path.is_file():records[name]=dict(passed=False,missing=str(path));continue
-        data=path.read_bytes();digest=hashlib.sha256(data.replace(b'\r\n',b'\n')).hexdigest()
-        records[name]=dict(path=str(path),sha256=hashlib.sha256(data).hexdigest(),lf_sha256=digest,
-                           passed=digest==wanted['lf_sha256'])
+        if name.startswith('vllm/'):
+            base=root;relative=Path(name).relative_to('vllm');scope='imported_vllm'
+        elif name.startswith('benchmarks/'):
+            base=repo;relative=Path(name);scope='service_repo_benchmark'
+        else:base=None;relative=Path(name);scope='unsupported_manifest_scope'
+        record=dict(scope=scope,passed=False,expected_lf_sha256=wanted['lf_sha256'])
+        records[name]=record
+        if base is None:
+            record['status']='skipped';record['reason']='source_root_unavailable'
+            skipped.append(dict(file=name,reason=record['reason'],scope=scope));continue
+        path=(base/relative).resolve();record['path']=str(path)
+        if not path.is_relative_to(base):
+            record.update(status='skipped',reason='path_outside_source_root')
+            skipped.append(dict(file=name,reason=record['reason'],scope=scope));continue
+        try:data=path.read_bytes()
+        except OSError as e:
+            record.update(status='mismatched',reason='source_unreadable',error=repr(e))
+            mismatched.append(dict(file=name,reason=record['reason'],scope=scope));continue
+        digest=hashlib.sha256(data.replace(b'\r\n',b'\n')).hexdigest()
+        checked.append(name)
+        record.update(sha256=hashlib.sha256(data).hexdigest(),lf_sha256=digest,
+                      passed=digest==wanted['lf_sha256'],status='checked')
+        if not record['passed']:
+            record.update(status='mismatched',reason='hash_mismatch')
+            mismatched.append(dict(file=name,reason='hash_mismatch',scope=scope))
     version=str(module.get('version','')).split('+')[0]
-    return dict(vllm_file=module['file'],vllm_version=module.get('version'),sources=records,
-                passed=all(x['passed'] for x in records.values()) and version=='0.9.1')
+    return dict(schema_version=2,vllm_file=module.get('file'),vllm_version=module.get('version'),
+                version_matches=version=='0.9.1',
+                service_repo=str(repo) if repo else None,sources=records,checked=checked,skipped=skipped,mismatched=mismatched,
+                expected_files=len(expected['sources']),
+                passed=bool(records) and len(checked)==len(records) and not skipped and not mismatched and version=='0.9.1')
 
 
 def main():
@@ -129,7 +151,7 @@ def main():
         rc,_=run(probe_command(a.service_python,'cpu_checks.py','--mode','identity','--out',path),
                  a.out,mode+'_import_identity',a.service_repo,environment(mode=='isolated',probe=True))
         if path.exists():
-            identities[mode]=load(path);sources[mode]=source_check(identities[mode])
+            identities[mode]=load(path);sources[mode]=source_check(identities[mode],a.service_repo)
     if a.predictor_python:
         run(probe_command(a.predictor_python,'environment_probe.py','--out',a.out/'predictor_B_metadata.json'),
             a.out,'predictor_B_metadata',a.service_repo,environment(True))

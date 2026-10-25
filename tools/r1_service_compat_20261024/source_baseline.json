@@ -2012,6 +2012,6 @@
     }
   },
   "repository": "https://github.com/scaramouch15/vllm091",
-  "path_base": "repository root; runtime comparison resolves paths from imported vllm.__file__",
+  "path_base": "vllm/* resolves from actual imported vllm.__file__; benchmarks/* resolves from explicit service_repo; all manifest files are required",
   "hash_policy": "lf_sha256 is canonical for cross-platform runtime-source comparison; sha256 records the original audit checkout bytes"
 }

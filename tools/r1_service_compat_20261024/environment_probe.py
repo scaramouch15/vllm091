@@ -33,7 +33,7 @@ def clean(value):
     return re.sub(r'https?://[^\s\"\'<>]+',url,value)
 
 
-def snapshot(repo=None):
+def snapshot(repo=None,pip_target_prefix=None):
     packages=[];active={}
     for dist in md.distributions():
         name=dist.metadata.get('Name','')
@@ -67,6 +67,12 @@ def snapshot(repo=None):
             conda.append(clean({k:data.get(k) for k in ['name','version','build','channel','url','sha256','md5']}))
         except (OSError,ValueError):conda.append({'unreadable':str(record)})
     result['conda_packages']=conda
+    if pip_target_prefix is not None:
+        import pip
+        from pip._internal.locations import get_scheme
+        scheme=get_scheme('',user=False,prefix=str(pip_target_prefix))
+        result['pip_identity']=dict(file=pip.__file__,version=pip.__version__,
+            target_prefix=str(pip_target_prefix),scheme={k:getattr(scheme,k) for k in ['purelib','platlib','scripts','data','headers']})
     if repo:
         result['repo']={}
         for key,args in [('head',['rev-parse','HEAD']),('branch',['branch','--show-current']),
@@ -79,5 +85,6 @@ def snapshot(repo=None):
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out',required=True,type=Path);p.add_argument('--repo')
+    p.add_argument('--pip-target-prefix',type=Path)
     a=p.parse_args()
-    with a.out.open('x',encoding='utf-8') as f:json.dump(snapshot(a.repo),f,ensure_ascii=False,indent=2,allow_nan=False)
+    with a.out.open('x',encoding='utf-8') as f:json.dump(snapshot(a.repo,a.pip_target_prefix),f,ensure_ascii=False,indent=2,allow_nan=False)

@@ -8,6 +8,8 @@
 
 本报告与工具由原仓库外目录迁入独立工具目录，补齐了相对路径适配和按已提交 Git blobs 构建的 `build_package.py`。下载包的 `SOURCE_COMMIT.json` 标识工具源码 commit，`source_baseline.json` 标识服务运行基线，两者不应混淆。具体生成和使用方式见 [README](README.md)。
 
+本轮工具修正的审查起点为 `34923534d2670a71e38c9b1632c13c3b95fd44ef`，继续在同一审查分支修正检查行为与本文，未修改服务运行逻辑。服务器共存步骤仍待执行；新工具包必须从修正提交重新生成。
+
 **已核实（前轮回传）**：B 环境及模型在独立预测器环境中已完成训练、质量检查和 A800 CPU 推理验证；AB 与 BA 四次模型验证均复现 1440 条保存预测。该证据尚未覆盖真实 vLLM 服务环境。不能把 B 的独立 sklearn 环境称为完整共存验证。
 
 **待服务器执行**：历史服务解释器 `$HOME/minitest/envs/vllm091-whb/bin/python` 的实际包库存、pip 安装计划、`vllm.__file__`/版本/源码、独立完整服务副本及 CPU 共存检查。目前不能宣称服务依赖兼容已经通过。
@@ -35,7 +37,7 @@
 1. 原始环境（保留原 PYTHONPATH/user site 行为）与隔离环境（禁用 user site，清除 PYTHONPATH/PYTHONHOME）。记录解释器、prefix、sys.path、包版本/安装器/direct_url/Requires-Dist、Conda 包的 channel/url/build/hash、模块 spec 位置、环境变量、pip freeze/config/debug/check。普通 pip 索引安装若未保留 direct_url，实际历史下载索引可能未知，不能猜测来源。
 2. 当前 pip 的 install help。支持时执行 `pip install --dry-run --report`，不升级 pip，不实际安装；可能访问现有索引并下载元数据/缓存。URL 凭据及 query 在交付记录中脱敏。
 3. 两种环境下独立 CPU 导入身份检查，保存实际 `vllm.__file__`、`torch.__file__` 与可用预测库的导入位置。缺失 sklearn 等属于本轮拟新增项，不伪装成已安装。
-4. 保存服务器 Git 状态/HEAD，并把实际导入的 vLLM 源码与本地审查文件的 LF 归一化 SHA256 比较。代码版本、导入来源或相关文件不同则暂停副本安装，先审查差异。
+4. 保存服务器 Git 状态/HEAD。schema_version=2 将 `vllm/*` 从实际导入的 vllm.__file__ 目录核对，`benchmarks/*` 从显式 service_repo 核对；清单全部 23 个相关文件都必须覆盖。结果报告 checked（计算了哈希的文件）、skipped（缺根目录等无法检查）、mismatched（缺文件/无法读取/哈希不一致，哈希不一致的文件也在 checked 中）。任何必要文件未核实均不能通过。旧版省略 benchmark 的检查结果必须重新生成。
 
 原始 pip check 失败属于**已有问题**；隔离后消失则优先标记用户 site/PYTHONPATH 污染；固定依赖计划要求替换既有包、引入无关依赖或解析失败属于**本轮计划问题**。两者分别保存，不自动修复。当前脚本对已有冲突采取保守 HOLD，不绕过它继续安装。
 
@@ -50,13 +52,20 @@ HOLD 后的最小处理建议：若仅用户 site/PYTHONPATH 影响来源，先�
 - 克隆来源是现场实际服务 `sys.prefix`，不是独立 sklearn 环境。新 prefix 必须位于用户 HOME 内、尚不存在，并与报告目录分离。
 - 先记录 `du --apparent-size` 和空闲空间，要求不超过用户输入的副本空间上限，并保留 20%+2 GiB 余量。使用 `conda create --clone ... --copy --offline`；缺少缓存、空间或复制失败时保留日志停止，不改用一个只有 sklearn 的环境冒充共存。
 - 保存克隆前后包库存。仅在副本内下载固定五个包的 wheel，核对 Name/Version/SHA256，使用本地 wheelhouse 做完整依赖解析。副本计划必须与已审查的纯新增计划相同，才允许副本 `pip install --report`；不忽略依赖。
+- 在任何 pip 下载/安装前，用副本解释器记录并显式检查 sys.prefix、sys.executable、真实导入 pip 的文件与元数据版本/位置，以及该 pip 为指定 prefix 计算的安装 scheme。位置不在副本或安装目标不匹配即停止，不能用包版本相同代替身份检查。
 - 副本安装命令使用副本的绝对 Python、显式 prefix、`--no-user`，并在该子进程禁用隐含的 pip 配置目标，避免全局 `--target/--user` 配置写到其他位置。下载/解析失败不切换版本或修改原环境。
 - 安装后 pip check、包库存比较，确认所有原有包版本均未改变。两个新进程分别测试 torch/vLLM→sklearn 与 sklearn→torch/vLLM 导入顺序；第三个进程在 vLLM/torch 已导入的情况下加载 B 模型，复现 1440 条长度/时长 raw/processed 预测，rtol=atol=1e-10。
 - 复用迁移包现有 `common.py`、`train_cpu.stages/comparison` 和原辅助函数，不运行训练或原计时 main。核对模型、数据、源码、预测身份和顺序；失败保留具体误差，不放宽容差。
 - 记录实际包路径、BLAS/OpenMP 和 torch CPU 线程设置。除可能为 editable checkout 的 vLLM 外，实际导入包必须位于副本 prefix；vLLM 的实际源路径和文件哈希另行记录，不能把原源码共享误称为源码也已独立复制。
 - 不实例化 LLM/AsyncLLM/EngineCore，不加载 LLM 权重。一次性 CPU 检查子进程启用 NVML availability 检查，并阻止 torch 的 lazy CUDA 初始化及 CUDA C 后端初始化/device-count fallback，检查 CUDA 未初始化；NVML 等平台探测可发生。若导入需要被阻止的调用，则保存错误并停止，不能解除保护绕过。保护仅存在于检查子进程；检查通过仍不能证明 GPU 模型执行兼容。
 
-此检查只能证明“完整服务依赖副本中的 CPU 导入和预测链路共存”。ABI、GPU 执行与真实服务并发仍留待以后授权验证。脚本运行结束后还会检查原服务包版本库存未变；源码文件只读。
+`cpu_checks.py` 的解释器/实际模块路径、版本、CUDA、文件哈希、样本身份与预测一致性门禁均采用显式异常，优化模式也不能移除；失败报告 passed=false，不打印成功。只有所有检查完成才写成功。
+
+结束阶段无论成功还是可捕获失败，都尝试 source_after，比较 active/prefix/executable/selected。无法读取或比较时状态 unknown/unverified，unchanged=null，不能写原环境未变。failure.json 保留最初错误及其 traceback，第二个结束核查错误另行记录；结束核查失败时即便前序 CPU 检查成功也不标完整成功。unchanged 仅指可观测快照字段一致。
+
+`original_environment_snapshot_unchanged` 表示上述全部字段是否一致；`original_package_versions_unchanged` 只表示版本库存是否一致。版本相同但来源变化时前者为 false、状态为 changed，不能称环境未变；无法完成结束核查时两者均为 null。
+
+此检查只能证明“完整服务依赖副本中的 CPU 导入和预测链路共存”。ABI、GPU 执行与真实服务并发仍留待以后授权验证；源码文件只读。
 
 ## 4. 真实调用链与前端文本缺口
 
@@ -87,7 +96,9 @@ HOLD 后的最小处理建议：若仅用户 site/PYTHONPATH 影响来源，先�
 
 建议在 `create_completion` 原生预处理和 `to_sampling_params` 成功后、创建 generate 之前，直接使用 `request_prompts[i]['prompt']` 与 `engine_prompt['prompt_token_ids']`。TF-IDF 直接调用训练 vectorizer.transform：不额外 strip、重排空白、解码、裁剪或重新实现分词。原生 truncate_prompt_tokens 会截 token IDs，却保留原文本，首轮凡开启该参数（含负数）均跳过；模型配置 do_lower_case 或其他输入改写未经核对也跳过。Processor 最终生成上限和 prompt token 数不符时丢弃数字预测、计 mismatch。
 
-只看“文本请求”不足以证明模板/Tokenizer 来源匹配。建议首轮复用已知 mixed 导出清单中的 **prompt_hash allowlist**、对应 prompt_len/max_tokens 和配置/模型记录，前端初始化时仅读这些核验字段，不读 task_type 作为特征；未命中或 token 数不符明确记 unverified_prompt_provenance/mismatch。它只是旁路范围校验，不替代原始数据源，不要求新的 YAML/JSON 实验协议，也不向 Core 发送文本。若历史 Tokenizer 文件哈希没有记录，须明示该溯源缺口，通过已验证文本/长度逐条匹配限定首轮范围，不能声称核对了不存在的历史哈希。该设置仍待审查，不能用几个模板关键词假装可靠匹配。
+首轮改由客户端冻结验收请求及其已处理文本、token 数、有效 max_tokens、模型/Tokenizer 配置；客户端保存样本→attempt/API/engine request_id 关联。服务端不加载文本成员表、不计算请求文本哈希来决定是否参与、不增加依赖该筛选的跳过原因或计时。仍检查输入形式、实际 token 数、有效生成上限、模型配置及 Processor 前后数值一致性。
+
+验收时按 request_id 对照服务端静态预测和客户端保存的 B 模型参考预测，保留缺失、额外及错误记录。时长预测须同时记录 sweep 序号和 running_count/kv_usage，在该次相同状态下离线重算并关联，不能拿不同状态的旧时长预测直接比较。客户端固定验收请求用于验证对应关系，不把 task_type 发送给服务端或用作特征；历史 Tokenizer 元数据缺失仍须明示。
 
 ### 字段与桥接
 
@@ -119,7 +130,7 @@ running 阶段可能已对本轮工作分配 KV 或发生释放，但其模型�
 | 设置 | 建议首轮值/行为 | 有界性和解释 |
 |---|---|---|
 | 开关 | 新旁路开关默认关闭；独立于 VLLM_R1_COLLECT | 关闭时不导入 sklearn、不加载模型、不建立预测统计容器、不计算/排序 |
-| 请求范围 | 已知 mixed prompt_hash allowlist，最多 128 个符合范围的 engine 请求 | 可涵盖 120 main+probe；超过范围计 measurement_limit，不扩大实验 |
+| 请求范围 | 客户端固定 120 个 main 请求及独立 probe；服务端仍只按必要输入/配置条件检查，验收窗口最多 128 个支持形式的 engine 请求 | 按 request_id 离线关联；超过窗口计 measurement_limit，不按文本成员筛选 |
 | 触发 | 上述 native waiting 尝试条件成立，且每 10 个这样的机会采样一次 | 计数而不是全局 RNG；最多 100 次旁路 sweep/服务生命周期 |
 | 候选 | 按原 waiting 顺序，用 islice 只看前 128 个，选前 32 个支持且未首次准入者 | 扫描与矩阵均有上限；不遍历整个 waiting，也不扫描 running |
 | 状态条件 | 首轮只选 WAITING、有效数字字段、first_admitted=False；FSM/remote/preempted 等跳过 | 不调用会推进这些状态的 native 方法 |
@@ -160,7 +171,7 @@ GBRT 没有本任务需要开启的并行预测选项，首先保留串行调用
 
 | 名称 | 建议边界 | 必须说明 |
 |---|---|---|
-| frontend_static | 范围/哈希检查、TF-IDF、SVD、长度头和后处理分别计时，另测整体 | 整体单独计时，不相加分项分位数；同步调用会占用前端执行时间 |
+| frontend_static | 输入形式/数值检查、TF-IDF、SVD、长度头和后处理分别计时，另测整体 | 不包含请求文本成员筛选；整体单独计时，不相加分项分位数 |
 | field_prepare | 校验 context、构造 tuple、复制到 ECR | 与文本编码分别记录 |
 | encode/decode | 在原 MsgpackEncoder.encode、decoder.decode 调用内同进程计时；记录字节数 | 新字段的增量可在相同输入的离线配对编码测试估计 |
 | transport_or_enqueue | await send、Core 输入队列停留等分别命名 | 发送到接收的总间隔还含 ZMQ、排队与进程调度；不能称为纯序列化成本，也不未经验证跨进程时钟直接相减 |
@@ -189,7 +200,7 @@ GBRT 没有本任务需要开启的并行预测选项，首先保留串行调用
 1. ECR 的 None/三数字/非法数值/default 字段经真实 Msgpack 和独立进程往返，request_id 与 num_prompt_tokens 对应；检查缺省编码字节及同版本 schema。
 2. 同一固定调度状态、同样 KV/FSM/LoRA/connector stub 和固定测试时钟：旁路关闭/开启后 waiting/running 顺序、原生对象字段/状态、KV 调用次数、token budget、SchedulerOutput 完全一致；新增旁路字段和统计另行核验。
 3. 首次分配失败不置 admitted；实际首次准入置 True；抢占、remote 状态转换和恢复不清零；已结束 Request 释放，无引用泄漏。
-4. 单 prompt/n=1 支持；多 prompt、n>1、token IDs、embeds、截断、max_tokens 不符、模型/模板 allowlist 不符均走原生并计跳过；n>1 不因子 params.n=1 而误判。
+4. 客户端固定验收请求按 request_id 对照预测，报告缺失/额外/错误，时长参考使用同次状态。单 prompt/n=1 支持；多 prompt、n>1、token IDs、embeds、截断、token 数/有效 max_tokens/模型配置不符均保留原生处理并计数；n>1 不因子 params.n=1 而误判。
 5. 取消发生在静态前、静态后未送 Core、Core waiting、首次准入后等位置，以及模型推理异常/字段校验失败；原 abort 与错误传播保留，旁路数据不误作完成标签。
 6. 关闭时通过 import spy、文件打开 spy、模型工厂 spy 检查不导入 sklearn、不加载权重、不创建预测容器/计算；执行原 mixed/collector 回归。
 7. 有界性：全不支持的长 waiting 也最多扫描 128 个；最多 32 候选；无候选不调用 predictor；达到窗口/频率上限时覆盖率和 skip_limit 可见。
@@ -200,7 +211,7 @@ GBRT 没有本任务需要开启的并行预测选项，首先保留串行调用
 - 真实服务库存和安装计划尚未取得；当前只有明确的拟安装目标，不能断言不影响现有依赖。先运行只读检查，返回 assessment 和日志。
 - 完整服务副本的复制成本、空间、pip/Conda 缓存和服务器源码一致性待现场检查。门禁 HOLD 时保留证据，由下一步审查决定最小处理，不自动替换包。
 - 进程内预测的线程限制对 torch 等同进程库的影响，需要根据服务实际池配置选择初始化策略或专用预测进程；本轮不擅自改变服务线程配置。
-- allowlist、128 请求窗口、32 候选/128 扫描、每 10 机会、最多 100 sweep 是首轮可测设置建议，尚未实施，不是最终调度公式。
+- 客户端固定验收请求、128 请求窗口、32 候选/128 扫描、每 10 机会、最多 100 sweep 都只是首轮验收建议，尚未实施，不是最终调度公式，也不代表正式在线开销实验已经完成。
 - B 在 AB/BA CPU 微基准中能复现质量，但静态路径相对性能出现顺序/时段相关变化；不能将某次快值当成线上预算保证。
 - 真实 GPU/服务并发、IPC 实际增量和墙钟干扰仍待未来授权；本轮不实施 Hook、Scheduler 预测、waiting 重排、训练或负载测试。
 
@@ -208,6 +219,6 @@ GBRT 没有本任务需要开启的并行预测选项，首先保留串行调用
 
 ## 12. 本地准备验证记录
 
-本次工具的 9 项标准库测试覆盖纯新增/已满足计划、禁止重装既有包、禁止 torch/CUDA/无关包变更、已有冲突及缺报告、进程级隔离与 URL 脱敏、源码来源比对、Python 3.10 语法和假模块 CUDA 初始化保护。迁入后验证 6 个 CLI help、README 四段及 TESTING 一段 Bash 命令语法；完整检查方法见 TESTING.md。测试输出保存在仓库外，不纳入源码提交。
+既有 9 项标准库测试保留；新增优化模式失败路径、克隆身份不符禁止后续 pip 操作、成功/中途失败的结束检查、双重错误保留原错、unknown/changed 状态、缺失 benchmark 根目录及 benchmark 哈希不一致回归。优化失败路径分别以 python -O 和 PYTHONOPTIMIZE=1 执行。完整方法与覆盖范围见 TESTING.md；输出保存在仓库外，不纳入源码提交。
 
 测试使用现有解释器，不安装新依赖；没有在本地导入真实 vLLM/torch/sklearn 或执行服务克隆。迁入后增加仓库根目录自动定位及 `R1_COMPAT_TEST_REPO`，使同一测试可在仓库内和解压工具包中核对真实基线。生成的包须逐文件与对应 commit 的 Git blobs 比较；报告与服务器说明不将未执行项目标记为成功。

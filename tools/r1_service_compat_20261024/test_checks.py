@@ -70,9 +70,9 @@ class Checks(unittest.TestCase):
                 self.skipTest('Extracted kit: set R1_COMPAT_TEST_REPO to check the real source baseline')
         path=repo/'vllm/__init__.py'
         identity={'modules':{'vllm':{'file':str(path),'version':'0.9.1'}}}
-        self.assertTrue(source_check(identity)['passed'])
+        self.assertTrue(source_check(identity,repo)['passed'])
         identity['modules']['vllm']['version']='0.9.10'
-        self.assertFalse(source_check(identity)['passed'])
+        self.assertFalse(source_check(identity,repo)['passed'])
 
     def test_cuda_initialization_guards_with_fake_modules(self):
         import cpu_checks
