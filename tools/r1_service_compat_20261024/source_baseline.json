@@ -1,0 +1,2017 @@
+{
+  "state": {
+    "branch": "research-v0.9.1",
+    "head": "09c35e97b0605bd437c725562ca05afaacdb82e1",
+    "diff_stat": ""
+  },
+  "sources": {
+    "vllm/entrypoints/openai/serving_completion.py": {
+      "sha256": "0384936f2b5aeb0427a00259f4aff9ccc08afc4a7bcd80383fcaa27468886b5f",
+      "lf_sha256": "a158ab8d789fb0bb10cdfe8c91ed5fe9d7de6c556b3118552fef0f96808e9bcb",
+      "anchors": {
+        "OpenAIServingCompletion": [
+          45
+        ],
+        "__init__": [
+          47
+        ],
+        "create_completion": [
+          69
+        ],
+        "completion_stream_generator": [
+          282
+        ],
+        "request_output_to_completion_response": [
+          429
+        ],
+        "_create_completion_logprobs": [
+          522
+        ],
+        "fake_stream_generator": [
+          274
+        ]
+      }
+    },
+    "vllm/entrypoints/openai/serving_engine.py": {
+      "sha256": "42774b08bd26dc3cc650f6d65712cc5da6ba51bcd3dab2138f87aba26fd93f6d",
+      "lf_sha256": "8a703fd0748113160037b5e766a54d13ea00920fffa3e11f2246941107faa43a",
+      "anchors": {
+        "TextTokensPrompt": [
+          108
+        ],
+        "EmbedsPrompt": [
+          113
+        ],
+        "is_text_tokens_prompt": [
+          120
+        ],
+        "is_embeds_prompt": [
+          125
+        ],
+        "RequestProcessingMixin": [
+          133
+        ],
+        "ResponseGenerationMixin": [
+          145
+        ],
+        "ServeContext": [
+          158
+        ],
+        "EmbeddingServeContext": [
+          184
+        ],
+        "OpenAIServing": [
+          197
+        ],
+        "clamp_prompt_logprobs": [
+          974
+        ],
+        "__init__": [
+          203
+        ],
+        "_preprocess": [
+          231
+        ],
+        "_build_response": [
+          241
+        ],
+        "handle": [
+          251
+        ],
+        "_pipeline": [
+          263
+        ],
+        "_validate_request": [
+          287
+        ],
+        "_prepare_generators": [
+          301
+        ],
+        "_collect_batch": [
+          363
+        ],
+        "create_error_response": [
+          398
+        ],
+        "create_streaming_error_response": [
+          407
+        ],
+        "_check_model": [
+          420
+        ],
+        "_maybe_get_adapters": [
+          451
+        ],
+        "_normalize_prompt_text_to_input": [
+          466
+        ],
+        "_normalize_prompt_tokens_to_input": [
+          499
+        ],
+        "_validate_input": [
+          517
+        ],
+        "_tokenize_prompt_input": [
+          577
+        ],
+        "_tokenize_prompt_inputs": [
+          599
+        ],
+        "_tokenize_prompt_input_or_inputs": [
+          629
+        ],
+        "_preprocess_completion": [
+          682,
+          695,
+          707
+        ],
+        "_preprocess_chat": [
+          761
+        ],
+        "_load_prompt_embeds": [
+          862
+        ],
+        "_log_inputs": [
+          891
+        ],
+        "_get_trace_headers": [
+          923
+        ],
+        "_base_request_id": [
+          938
+        ],
+        "_get_decoded_token": [
+          948
+        ],
+        "_is_model_supported": [
+          959
+        ],
+        "_get_model_name": [
+          964
+        ],
+        "_load_and_validate_embed": [
+          868
+        ]
+      }
+    },
+    "vllm/v1/engine/async_llm.py": {
+      "sha256": "a324e986438c508685cae2bfbd979a44224ac57e23e8034f76496d70b60f52a4",
+      "lf_sha256": "41212dd6e84ed4fa05a3715975df91b801c5999143c97a32260ee8080fe94fe6",
+      "anchors": {
+        "AsyncLLM": [
+          48
+        ],
+        "__init__": [
+          50
+        ],
+        "from_vllm_config": [
+          155
+        ],
+        "from_engine_args": [
+          187
+        ],
+        "__del__": [
+          211
+        ],
+        "shutdown": [
+          214
+        ],
+        "add_request": [
+          232
+        ],
+        "_add_request": [
+          279
+        ],
+        "generate": [
+          299
+        ],
+        "_record_collection_error": [
+          388
+        ],
+        "_run_output_handler": [
+          397
+        ],
+        "abort": [
+          460
+        ],
+        "_record_stats": [
+          470
+        ],
+        "encode": [
+          481
+        ],
+        "get_vllm_config": [
+          492
+        ],
+        "get_model_config": [
+          495
+        ],
+        "get_decoding_config": [
+          498
+        ],
+        "get_input_preprocessor": [
+          501
+        ],
+        "get_tokenizer": [
+          504
+        ],
+        "is_tracing_enabled": [
+          510
+        ],
+        "do_log_stats": [
+          513
+        ],
+        "check_health": [
+          522
+        ],
+        "start_profile": [
+          525
+        ],
+        "stop_profile": [
+          528
+        ],
+        "reset_mm_cache": [
+          531
+        ],
+        "reset_prefix_cache": [
+          536
+        ],
+        "sleep": [
+          542
+        ],
+        "wake_up": [
+          545
+        ],
+        "is_sleeping": [
+          548
+        ],
+        "add_lora": [
+          551
+        ],
+        "remove_lora": [
+          555
+        ],
+        "list_loras": [
+          559
+        ],
+        "pin_lora": [
+          563
+        ],
+        "collective_rpc": [
+          567
+        ],
+        "is_running": [
+          579
+        ],
+        "is_stopped": [
+          584
+        ],
+        "errored": [
+          588
+        ],
+        "dead_error": [
+          592
+        ],
+        "output_handler": [
+          410
+        ]
+      }
+    },
+    "vllm/v1/engine/processor.py": {
+      "sha256": "14056c65825802c69b0e3ec8104841efe591f31a51890e1037c77b12ed1331a8",
+      "lf_sha256": "58b38f82cd638dc5536b83a9eac59f8bce192f84c05a1eac759dcac20cf7a9e9",
+      "anchors": {
+        "Processor": [
+          30
+        ],
+        "__init__": [
+          32
+        ],
+        "mm_registry": [
+          59
+        ],
+        "_validate_logprobs": [
+          62
+        ],
+        "_validate_sampling_params": [
+          79
+        ],
+        "_validate_logit_bias": [
+          97
+        ],
+        "_validate_supported_sampling_params": [
+          117
+        ],
+        "_validate_params": [
+          129
+        ],
+        "_validate_lora": [
+          146
+        ],
+        "_validate_structured_output": [
+          151
+        ],
+        "process_inputs": [
+          204
+        ],
+        "_validate_model_inputs": [
+          341
+        ],
+        "_validate_model_input": [
+          355
+        ]
+      }
+    },
+    "vllm/v1/engine/__init__.py": {
+      "sha256": "74cfdd4bac7bb993f2c0bd3f8db3cafff84bc7574ef9c1b8f65860188d1ba1b9",
+      "lf_sha256": "4ea54e89a143dd8d862acde9b032206c1bac15ed2459d4f854ada89341a48dae",
+      "anchors": {
+        "FinishReason": [
+          23
+        ],
+        "EngineCoreRequest": [
+          42
+        ],
+        "EngineCoreEventType": [
+          70
+        ],
+        "EngineCoreEvent": [
+          77
+        ],
+        "EngineCoreOutput": [
+          95
+        ],
+        "UtilityOutput": [
+          120
+        ],
+        "EngineCoreOutputs": [
+          132
+        ],
+        "EngineCoreRequestType": [
+          163
+        ],
+        "__str__": [
+          38
+        ],
+        "new_event": [
+          88
+        ],
+        "finished": [
+          116
+        ],
+        "__post_init__": [
+          158
+        ]
+      }
+    },
+    "vllm/v1/engine/core.py": {
+      "sha256": "795eb4c38f2f2773d4b211a1bbbad3caeb26d572ea7d3f2e4ac8a6e427ddb477",
+      "lf_sha256": "2f93a2b9cd0b46db5f812e9aa8cd5ec64acec6156843b0283968b199bf13db04",
+      "anchors": {
+        "EngineCore": [
+          55
+        ],
+        "EngineCoreProc": [
+          364
+        ],
+        "DPEngineCoreProc": [
+          747
+        ],
+        "DPEngineCoreActor": [
+          903
+        ],
+        "__init__": [
+          58,
+          369,
+          751,
+          908
+        ],
+        "_initialize_kv_caches": [
+          132
+        ],
+        "add_request": [
+          175,
+          817
+        ],
+        "abort_requests": [
+          200
+        ],
+        "execute_model": [
+          209
+        ],
+        "step": [
+          219
+        ],
+        "step_with_batch_queue": [
+          238
+        ],
+        "shutdown": [
+          286,
+          812
+        ],
+        "profile": [
+          299
+        ],
+        "reset_mm_cache": [
+          302
+        ],
+        "reset_prefix_cache": [
+          311
+        ],
+        "sleep": [
+          314
+        ],
+        "wake_up": [
+          317
+        ],
+        "is_sleeping": [
+          320
+        ],
+        "execute_dummy_batch": [
+          323
+        ],
+        "add_lora": [
+          326
+        ],
+        "remove_lora": [
+          329
+        ],
+        "list_loras": [
+          332
+        ],
+        "pin_lora": [
+          335
+        ],
+        "save_sharded_state": [
+          338
+        ],
+        "collective_rpc": [
+          348
+        ],
+        "save_tensorized_model": [
+          356
+        ],
+        "_perform_handshake": [
+          419,
+          935
+        ],
+        "startup_handshake": [
+          449
+        ],
+        "run_engine_core": [
+          478
+        ],
+        "_init_data_parallel": [
+          530,
+          782
+        ],
+        "run_busy_loop": [
+          533,
+          855
+        ],
+        "_process_input_queue": [
+          543
+        ],
+        "_process_engine_step": [
+          562
+        ],
+        "_handle_client_request": [
+          573,
+          829
+        ],
+        "_convert_msgspec_args": [
+          601
+        ],
+        "_send_engine_dead": [
+          614
+        ],
+        "process_input_sockets": [
+          626
+        ],
+        "process_output_sockets": [
+          685
+        ],
+        "_decorate_logs": [
+          773,
+          931
+        ],
+        "_maybe_publish_request_counts": [
+          843
+        ],
+        "_has_global_unfinished_reqs": [
+          891
+        ],
+        "wait_for_init": [
+          944
+        ],
+        "run": [
+          954
+        ],
+        "signal_handler": [
+          492
+        ]
+      }
+    },
+    "vllm/v1/engine/core_client.py": {
+      "sha256": "6d17ff3be9d2547913ca90bd9870299248f06a86800df7150bfb1cf0793e4339",
+      "lf_sha256": "d0c590268d9e820bdc21dee55eb27f9429c73b1e8b077d0de023f1fa7df8e7bd",
+      "anchors": {
+        "EngineCoreClient": [
+          44
+        ],
+        "InprocClient": [
+          212
+        ],
+        "BackgroundResources": [
+          287
+        ],
+        "MPClient": [
+          344
+        ],
+        "_process_utility_output": [
+          543
+        ],
+        "SyncMPClient": [
+          553
+        ],
+        "AsyncMPClient": [
+          707
+        ],
+        "DPAsyncMPClient": [
+          904
+        ],
+        "RayDPClient": [
+          1085
+        ],
+        "make_client": [
+          56
+        ],
+        "make_async_mp_client": [
+          80
+        ],
+        "shutdown": [
+          97,
+          236,
+          521
+        ],
+        "get_output": [
+          100,
+          225,
+          619
+        ],
+        "add_request": [
+          103,
+          229,
+          652
+        ],
+        "profile": [
+          106,
+          239,
+          659
+        ],
+        "reset_mm_cache": [
+          109,
+          242,
+          662
+        ],
+        "reset_prefix_cache": [
+          112,
+          245,
+          665
+        ],
+        "sleep": [
+          115,
+          248,
+          680
+        ],
+        "wake_up": [
+          118,
+          251,
+          683
+        ],
+        "is_sleeping": [
+          121,
+          254,
+          686
+        ],
+        "execute_dummy_batch": [
+          124,
+          257,
+          689
+        ],
+        "execute_dummy_batch_async": [
+          127,
+          872
+        ],
+        "abort_requests": [
+          130,
+          232,
+          655
+        ],
+        "add_lora": [
+          133,
+          260,
+          668
+        ],
+        "remove_lora": [
+          136,
+          263,
+          671
+        ],
+        "list_loras": [
+          139,
+          266,
+          674
+        ],
+        "pin_lora": [
+          142,
+          269,
+          677
+        ],
+        "save_sharded_state": [
+          145,
+          272,
+          700
+        ],
+        "collective_rpc": [
+          151,
+          278,
+          692
+        ],
+        "get_output_async": [
+          158,
+          782
+        ],
+        "add_request_async": [
+          161,
+          845,
+          1034
+        ],
+        "profile_async": [
+          164,
+          854
+        ],
+        "reset_mm_cache_async": [
+          167,
+          857
+        ],
+        "reset_prefix_cache_async": [
+          170,
+          860
+        ],
+        "sleep_async": [
+          173,
+          863
+        ],
+        "wake_up_async": [
+          176,
+          866
+        ],
+        "is_sleeping_async": [
+          179,
+          869
+        ],
+        "abort_requests_async": [
+          182,
+          850,
+          1061
+        ],
+        "add_lora_async": [
+          185,
+          875
+        ],
+        "remove_lora_async": [
+          188,
+          878
+        ],
+        "list_loras_async": [
+          191,
+          881
+        ],
+        "pin_lora_async": [
+          194,
+          884
+        ],
+        "save_sharded_state_async": [
+          197,
+          887
+        ],
+        "collective_rpc_async": [
+          203,
+          894
+        ],
+        "__init__": [
+          222,
+          357,
+          556,
+          710,
+          908,
+          1091
+        ],
+        "__call__": [
+          308
+        ],
+        "validate_alive": [
+          337
+        ],
+        "_init_engines_direct": [
+          454,
+          1102
+        ],
+        "_wait_for_engine_startup": [
+          494
+        ],
+        "_format_exception": [
+          525
+        ],
+        "ensure_alive": [
+          530
+        ],
+        "add_pending_message": [
+          534
+        ],
+        "free_pending_messages": [
+          538
+        ],
+        "_send_input": [
+          628,
+          793
+        ],
+        "call_utility": [
+          643
+        ],
+        "_ensure_output_queue_task": [
+          737
+        ],
+        "_send_input_message": [
+          804
+        ],
+        "call_utility_async": [
+          829,
+          1027
+        ],
+        "_call_utility_async": [
+          834
+        ],
+        "_ensure_stats_update_task": [
+          941
+        ],
+        "get_core_engine_for_request": [
+          998
+        ],
+        "process_engine_outputs": [
+          1055
+        ],
+        "_abort_requests": [
+          1078
+        ],
+        "process_outputs_socket": [
+          580,
+          755
+        ],
+        "add_pending": [
+          822
+        ],
+        "run_engine_stats_update_task": [
+          948
+        ]
+      }
+    },
+    "vllm/v1/request.py": {
+      "sha256": "8168e9d20e641f42a8ae511470b38b27a8a0b0c86ce8c4e1a184f23abcd80815",
+      "lf_sha256": "918c39696494d11a4aeb3dbbd60a79fe7e12b68e9ce6fbc0a6d4da6783e006c1",
+      "anchors": {
+        "Request": [
+          19
+        ],
+        "RequestStatus": [
+          160
+        ],
+        "__init__": [
+          21
+        ],
+        "from_engine_core_request": [
+          87
+        ],
+        "append_output_token_ids": [
+          108
+        ],
+        "num_tokens": [
+          120
+        ],
+        "num_tokens_with_spec": [
+          124
+        ],
+        "num_output_tokens": [
+          128
+        ],
+        "is_finished": [
+          131,
+          175
+        ],
+        "get_finished_reason": [
+          134,
+          179
+        ],
+        "get_num_encoder_tokens": [
+          137
+        ],
+        "use_structured_output": [
+          143
+        ],
+        "record_event": [
+          146
+        ],
+        "take_events": [
+          153
+        ]
+      }
+    },
+    "vllm/v1/core/sched/scheduler.py": {
+      "sha256": "034518377a9d004464b428cf2ce8709f6198efc1d59d794759c7058f1255fb76",
+      "lf_sha256": "fabf75d61d648648b8d70ae39cc4a10c802420287604d2ad1fdb4755e73223eb",
+      "anchors": {
+        "Scheduler": [
+          39
+        ],
+        "__init__": [
+          41
+        ],
+        "schedule": [
+          179
+        ],
+        "_make_cached_request_data": [
+          618
+        ],
+        "_try_schedule_encoder_inputs": [
+          649
+        ],
+        "update_from_output": [
+          732
+        ],
+        "get_request_counts": [
+          899
+        ],
+        "add_request": [
+          903
+        ],
+        "finish_requests": [
+          909
+        ],
+        "_free_request": [
+          938
+        ],
+        "_free_blocks": [
+          957
+        ],
+        "get_num_unfinished_requests": [
+          964
+        ],
+        "has_finished_requests": [
+          967
+        ],
+        "reset_prefix_cache": [
+          970
+        ],
+        "make_stats": [
+          973
+        ],
+        "make_spec_decoding_stats": [
+          989
+        ],
+        "shutdown": [
+          1004
+        ],
+        "get_kv_connector": [
+          1014
+        ],
+        "_connector_finished": [
+          1017
+        ],
+        "_update_waiting_for_remote_kv": [
+          1031
+        ],
+        "_update_from_kv_xfer_finished": [
+          1063
+        ]
+      }
+    },
+    "vllm/v1/core/sched/interface.py": {
+      "sha256": "e8ed57d96e0a62931ad6090878b7dc375cd7fdd3c4d05e6229f8a2d5d6603267",
+      "lf_sha256": "98a535235c8485c49fe4f154b7b4d2915b5177c2e58aa761f25a72df0f68079f",
+      "anchors": {
+        "SchedulerInterface": [
+          16
+        ],
+        "schedule": [
+          19
+        ],
+        "update_from_output": [
+          45
+        ],
+        "add_request": [
+          65
+        ],
+        "finish_requests": [
+          74
+        ],
+        "get_num_unfinished_requests": [
+          94
+        ],
+        "has_unfinished_requests": [
+          98
+        ],
+        "has_finished_requests": [
+          104
+        ],
+        "has_requests": [
+          118
+        ],
+        "reset_prefix_cache": [
+          124
+        ],
+        "get_request_counts": [
+          132
+        ],
+        "make_stats": [
+          137
+        ],
+        "shutdown": [
+          145
+        ],
+        "get_kv_connector": [
+          149
+        ]
+      }
+    },
+    "vllm/v1/core/sched/output.py": {
+      "sha256": "5f233cb06db296e1e95db8acae4d643c6e50d5172d679f29b4d59839d984ec6d",
+      "lf_sha256": "1e2ce139f5ce455aaf80769c20e50fecdba2ab07fc2e91279c3e0d58f7138a71",
+      "anchors": {
+        "NewRequestData": [
+          22
+        ],
+        "CachedRequestData": [
+          81
+        ],
+        "SchedulerOutput": [
+          110
+        ],
+        "from_request": [
+          35,
+          93
+        ],
+        "__repr__": [
+          52
+        ],
+        "anon_repr": [
+          66
+        ]
+      }
+    },
+    "vllm/v1/core/kv_cache_manager.py": {
+      "sha256": "26ec50cd1c500b8c78f09d926cef9d92e0a40a97630c256ced18e2b3609f503c",
+      "lf_sha256": "0901b54b8a88f952d633f9683eba2d38ab02d31ad3a70bd1b525dce82e77d715",
+      "anchors": {
+        "KVCacheBlocks": [
+          22
+        ],
+        "KVCacheManager": [
+          67
+        ],
+        "__add__": [
+          37
+        ],
+        "get_block_ids": [
+          43,
+          378
+        ],
+        "get_unhashed_block_ids": [
+          54
+        ],
+        "new_empty": [
+          62
+        ],
+        "__init__": [
+          69
+        ],
+        "usage": [
+          113
+        ],
+        "make_prefix_cache_stats": [
+          121
+        ],
+        "get_computed_blocks": [
+          133
+        ],
+        "allocate_slots": [
+          182
+        ],
+        "free": [
+          293
+        ],
+        "reset_prefix_cache": [
+          303
+        ],
+        "get_num_common_prefix_blocks": [
+          319
+        ],
+        "free_block_hashes": [
+          362
+        ],
+        "take_events": [
+          370
+        ],
+        "cache_blocks": [
+          383
+        ],
+        "create_empty_block_list": [
+          389
+        ]
+      }
+    },
+    "vllm/v1/core/block_pool.py": {
+      "sha256": "729037178be0db0dcccd6f9998eab0593729eecde66853bb527aded859a78911",
+      "lf_sha256": "845535af8ab6db466b0277bde183ce06de1f6c607e51136381e33b0423b49175",
+      "anchors": {
+        "BlockPool": [
+          19
+        ],
+        "__init__": [
+          33
+        ],
+        "get_cached_block": [
+          72
+        ],
+        "cache_full_blocks": [
+          96
+        ],
+        "get_new_blocks": [
+          202
+        ],
+        "_maybe_evict_cached_block": [
+          234
+        ],
+        "touch": [
+          263
+        ],
+        "free_blocks": [
+          279
+        ],
+        "reset_prefix_cache": [
+          293
+        ],
+        "get_num_free_blocks": [
+          323
+        ],
+        "get_usage": [
+          331
+        ],
+        "take_events": [
+          339
+        ]
+      }
+    },
+    "vllm/v1/metrics/request_collector.py": {
+      "sha256": "5ede315af4b4fc7a703156862ecb3583939a0e2b841a67909abc7100aec5c963",
+      "lf_sha256": "5ede315af4b4fc7a703156862ecb3583939a0e2b841a67909abc7100aec5c963",
+      "anchors": {
+        "CollectionConfig": [
+          35
+        ],
+        "RecordWriter": [
+          79
+        ],
+        "AdmissionSnapshot": [
+          300
+        ],
+        "CoreCollector": [
+          310
+        ],
+        "FrontendCollector": [
+          366
+        ],
+        "ClientAttempt": [
+          439
+        ],
+        "ClientCollector": [
+          512
+        ],
+        "_client_batch_counts": [
+          554
+        ],
+        "merge_records": [
+          627
+        ],
+        "main": [
+          835
+        ],
+        "from_env": [
+          43
+        ],
+        "require_stats": [
+          59
+        ],
+        "validate_engine_request": [
+          66
+        ],
+        "__init__": [
+          87,
+          311,
+          367,
+          440,
+          513
+        ],
+        "observe": [
+          127
+        ],
+        "_warn_once": [
+          132
+        ],
+        "emit": [
+          145
+        ],
+        "_write": [
+          185
+        ],
+        "_flush": [
+          201
+        ],
+        "_run": [
+          208
+        ],
+        "close": [
+          278,
+          362,
+          435,
+          550
+        ],
+        "snapshot": [
+          318
+        ],
+        "admit": [
+          345
+        ],
+        "forget": [
+          359
+        ],
+        "finished": [
+          372
+        ],
+        "diagnostic": [
+          420
+        ],
+        "start": [
+          446
+        ],
+        "finish": [
+          495
+        ],
+        "prepare": [
+          538
+        ],
+        "probe": [
+          547
+        ]
+      }
+    },
+    "vllm/v1/metrics/stats.py": {
+      "sha256": "d669dabb4104bc997e8bf7464483651b36eaf79c8228f4a1c8f3889d8a75eaac",
+      "lf_sha256": "ba99f2cb224a2444a20bbd5041d8e5067164ce488c400d039fbd28137b20f714",
+      "anchors": {
+        "PrefixCacheStats": [
+          16
+        ],
+        "SchedulerStats": [
+          30
+        ],
+        "LoRAStats": [
+          45
+        ],
+        "RequestStateStats": [
+          51
+        ],
+        "FinishedRequestStats": [
+          67
+        ],
+        "IterationStats": [
+          81
+        ],
+        "LoRARequestStates": [
+          183
+        ],
+        "__init__": [
+          84,
+          186
+        ],
+        "_time_since": [
+          97
+        ],
+        "update_from_output": [
+          101
+        ],
+        "update_from_events": [
+          131
+        ],
+        "update_from_finished_request": [
+          149
+        ],
+        "get_stats": [
+          189
+        ],
+        "add_request": [
+          196
+        ],
+        "finish_request": [
+          200
+        ],
+        "abort_request": [
+          206
+        ],
+        "scheduled_request": [
+          216
+        ],
+        "preempted_request": [
+          223
+        ],
+        "update_iteration_stats": [
+          229
+        ]
+      }
+    },
+    "vllm/v1/serial_utils.py": {
+      "sha256": "7fced60eb42b25232a05e40153bbf38da04e6ca003631b1d4e86c3332910733c",
+      "lf_sha256": "577fd809ee599ed747275fdf4a0798dbd29b203cc6cf5832267a25a48bd9f8e6",
+      "anchors": {
+        "_log_insecure_serialization_warning": [
+          44
+        ],
+        "MsgpackEncoder": [
+          49
+        ],
+        "MsgpackDecoder": [
+          195
+        ],
+        "__init__": [
+          59,
+          202
+        ],
+        "encode": [
+          71
+        ],
+        "encode_into": [
+          83
+        ],
+        "enc_hook": [
+          92
+        ],
+        "_encode_ndarray": [
+          138
+        ],
+        "_encode_tensor": [
+          158
+        ],
+        "_encode_nested_tensors": [
+          174
+        ],
+        "_encode_mm_field": [
+          183
+        ],
+        "decode": [
+          211
+        ],
+        "dec_hook": [
+          223
+        ],
+        "_decode_ndarray": [
+          242
+        ],
+        "_decode_tensor": [
+          249
+        ],
+        "_decode_mm_items": [
+          266
+        ],
+        "_decode_nested_tensors": [
+          287
+        ],
+        "_decode_nested_slices": [
+          298
+        ],
+        "ext_hook": [
+          304
+        ]
+      }
+    },
+    "vllm/sampling_params.py": {
+      "sha256": "204af02de682a3a20c802c87a13ccc20b717988adb4ecab1bf451ec864784f5d",
+      "lf_sha256": "b2a52f87e453f1a32dafe8fb106ce35a3868510732fb63c48cb479a324cd551c",
+      "anchors": {
+        "SamplingType": [
+          24
+        ],
+        "GuidedDecodingParams": [
+          32
+        ],
+        "RequestOutputKind": [
+          109
+        ],
+        "SamplingParams": [
+          118
+        ],
+        "BeamSearchParams": [
+          591
+        ],
+        "from_optional": [
+          49,
+          252
+        ],
+        "__post_init__": [
+          76,
+          327
+        ],
+        "_extract_backend_options": [
+          96
+        ],
+        "_verify_args": [
+          387
+        ],
+        "_verify_greedy_sampling": [
+          464
+        ],
+        "update_from_generation_config": [
+          469
+        ],
+        "update_from_tokenizer": [
+          495
+        ],
+        "sampling_type": [
+          532
+        ],
+        "all_stop_token_ids": [
+          540
+        ],
+        "bad_words_token_ids": [
+          544
+        ],
+        "clone": [
+          548
+        ],
+        "__repr__": [
+          563
+        ]
+      }
+    },
+    "vllm/entrypoints/openai/protocol.py": {
+      "sha256": "f2a8f805ac2eb7cbe77d6aaebd5df8daacfeac394c9eb01b475671884e07892e",
+      "lf_sha256": "9c6cda68dac5beb973f90a3d60df13f5a67e5f020576e641520a6a5ee738ce20",
+      "anchors": {
+        "OpenAIBaseModel": [
+          33
+        ],
+        "ErrorResponse": [
+          66
+        ],
+        "ModelPermission": [
+          74
+        ],
+        "ModelCard": [
+          89
+        ],
+        "ModelList": [
+          100
+        ],
+        "PromptTokenUsageInfo": [
+          105
+        ],
+        "UsageInfo": [
+          109
+        ],
+        "RequestResponseMetadata": [
+          116
+        ],
+        "JsonSchemaResponseFormat": [
+          121
+        ],
+        "StructuralTag": [
+          130
+        ],
+        "StructuralTagResponseFormat": [
+          139
+        ],
+        "ResponseFormat": [
+          145
+        ],
+        "StreamOptions": [
+          154
+        ],
+        "FunctionDefinition": [
+          159
+        ],
+        "ChatCompletionToolsParam": [
+          165
+        ],
+        "ChatCompletionNamedFunction": [
+          170
+        ],
+        "ChatCompletionNamedToolChoiceParam": [
+          174
+        ],
+        "LogitsProcessorConstructor": [
+          181
+        ],
+        "get_logits_processors": [
+          192
+        ],
+        "ChatCompletionRequest": [
+          223
+        ],
+        "CompletionRequest": [
+          751
+        ],
+        "EmbeddingCompletionRequest": [
+          1045
+        ],
+        "EmbeddingChatRequest": [
+          1081
+        ],
+        "ScoreRequest": [
+          1151
+        ],
+        "RerankRequest": [
+          1176
+        ],
+        "RerankDocument": [
+          1202
+        ],
+        "RerankResult": [
+          1206
+        ],
+        "RerankUsage": [
+          1212
+        ],
+        "RerankResponse": [
+          1216
+        ],
+        "CompletionLogProbs": [
+          1223
+        ],
+        "CompletionResponseChoice": [
+          1231
+        ],
+        "CompletionResponse": [
+          1246
+        ],
+        "CompletionResponseStreamChoice": [
+          1257
+        ],
+        "CompletionStreamResponse": [
+          1271
+        ],
+        "EmbeddingResponseData": [
+          1280
+        ],
+        "EmbeddingResponse": [
+          1286
+        ],
+        "PoolingResponseData": [
+          1295
+        ],
+        "PoolingResponse": [
+          1301
+        ],
+        "ScoreResponseData": [
+          1310
+        ],
+        "ScoreResponse": [
+          1316
+        ],
+        "ClassificationRequest": [
+          1325
+        ],
+        "ClassificationData": [
+          1350
+        ],
+        "ClassificationResponse": [
+          1357
+        ],
+        "FunctionCall": [
+          1366
+        ],
+        "ToolCall": [
+          1371
+        ],
+        "DeltaFunctionCall": [
+          1377
+        ],
+        "DeltaToolCall": [
+          1383
+        ],
+        "ExtractedToolCallInformation": [
+          1390
+        ],
+        "ChatMessage": [
+          1402
+        ],
+        "ChatCompletionLogProb": [
+          1409
+        ],
+        "ChatCompletionLogProbsContent": [
+          1415
+        ],
+        "ChatCompletionLogProbs": [
+          1422
+        ],
+        "ChatCompletionResponseChoice": [
+          1426
+        ],
+        "ChatCompletionResponse": [
+          1436
+        ],
+        "DeltaMessage": [
+          1448
+        ],
+        "ChatCompletionResponseStreamChoice": [
+          1455
+        ],
+        "ChatCompletionStreamResponse": [
+          1463
+        ],
+        "TranscriptionResponseStreamChoice": [
+          1472
+        ],
+        "TranscriptionStreamResponse": [
+          1478
+        ],
+        "BatchRequestInput": [
+          1491
+        ],
+        "BatchResponseData": [
+          1529
+        ],
+        "BatchRequestOutput": [
+          1541
+        ],
+        "TokenizeCompletionRequest": [
+          1559
+        ],
+        "TokenizeChatRequest": [
+          1576
+        ],
+        "TokenizeResponse": [
+          1645
+        ],
+        "DetokenizeRequest": [
+          1652
+        ],
+        "DetokenizeResponse": [
+          1657
+        ],
+        "LoadLoRAAdapterRequest": [
+          1661
+        ],
+        "UnloadLoRAAdapterRequest": [
+          1666
+        ],
+        "TranscriptionRequest": [
+          1676
+        ],
+        "TranscriptionResponse": [
+          1841
+        ],
+        "TranscriptionWord": [
+          1846
+        ],
+        "TranscriptionSegment": [
+          1857
+        ],
+        "TranscriptionResponseVerbose": [
+          1899
+        ],
+        "__log_extra_fields__": [
+          42
+        ],
+        "to_beam_search_params": [
+          427,
+          879
+        ],
+        "to_sampling_params": [
+          458,
+          908,
+          1780
+        ],
+        "_get_guided_json_from_tool": [
+          557
+        ],
+        "validate_stream_options": [
+          612,
+          1029
+        ],
+        "check_logprobs": [
+          621,
+          1013
+        ],
+        "check_guided_decoding_count": [
+          643,
+          999
+        ],
+        "check_tool_usage": [
+          669
+        ],
+        "check_generation_prompt": [
+          729,
+          1132,
+          1634
+        ],
+        "check_cache_salt_support": [
+          738
+        ],
+        "validate_prompt_and_prompt_embeds": [
+          1038
+        ],
+        "to_pooling_params": [
+          1076,
+          1139,
+          1172,
+          1198,
+          1346
+        ],
+        "check_type_for_url": [
+          1515
+        ],
+        "validate_transcription_request": [
+          1824
+        ],
+        "get_tool_schema": [
+          578
+        ]
+      }
+    },
+    "vllm/entrypoints/openai/api_server.py": {
+      "sha256": "29f61842d042012f16cbe79db163f060ed6e482ef81553cf0dc4199f9c8089e1",
+      "lf_sha256": "332355bf14d9e3974dbc5a637536cdcbcc5dc900db7a8dad103b28b7c57cd6c2",
+      "anchors": {
+        "lifespan": [
+          115
+        ],
+        "build_async_engine_client": [
+          146
+        ],
+        "build_async_engine_client_from_engine_args": [
+          162
+        ],
+        "validate_json_request": [
+          314
+        ],
+        "PrometheusResponse": [
+          326
+        ],
+        "mount_metrics": [
+          330
+        ],
+        "base": [
+          359
+        ],
+        "models": [
+          364
+        ],
+        "chat": [
+          368
+        ],
+        "completion": [
+          372
+        ],
+        "pooling": [
+          376
+        ],
+        "embedding": [
+          380
+        ],
+        "score": [
+          384
+        ],
+        "classify": [
+          388
+        ],
+        "rerank": [
+          392
+        ],
+        "tokenization": [
+          396
+        ],
+        "transcription": [
+          400
+        ],
+        "engine_client": [
+          404
+        ],
+        "health": [
+          409
+        ],
+        "get_server_load_metrics": [
+          416
+        ],
+        "ping": [
+          436
+        ],
+        "tokenize": [
+          458
+        ],
+        "detokenize": [
+          493
+        ],
+        "show_available_models": [
+          514
+        ],
+        "show_version": [
+          522
+        ],
+        "create_chat_completion": [
+          547
+        ],
+        "create_completion": [
+          586
+        ],
+        "create_embedding": [
+          622
+        ],
+        "create_pooling": [
+          651
+        ],
+        "create_classify": [
+          670
+        ],
+        "create_score": [
+          700
+        ],
+        "create_score_v1": [
+          728
+        ],
+        "create_transcriptions": [
+          755
+        ],
+        "do_rerank": [
+          789
+        ],
+        "do_rerank_v1": [
+          815
+        ],
+        "do_rerank_v2": [
+          835
+        ],
+        "invocations": [
+          926
+        ],
+        "load_log_config": [
+          1005
+        ],
+        "build_app": [
+          1017
+        ],
+        "init_app_state": [
+          1122
+        ],
+        "create_server_socket": [
+          1255
+        ],
+        "validate_api_server_args": [
+          1268
+        ],
+        "setup_server": [
+          1283
+        ],
+        "run_server": [
+          1320
+        ],
+        "run_server_worker": [
+          1326
+        ],
+        "show_server_info": [
+          867
+        ],
+        "reset_prefix_cache": [
+          872
+        ],
+        "sleep": [
+          886
+        ],
+        "wake_up": [
+          895
+        ],
+        "is_sleeping": [
+          907
+        ],
+        "start_profile": [
+          961
+        ],
+        "stop_profile": [
+          968
+        ],
+        "load_lora_adapter": [
+          982
+        ],
+        "unload_lora_adapter": [
+          994
+        ],
+        "http_exception_handler": [
+          1039
+        ],
+        "validation_exception_handler": [
+          1046
+        ],
+        "signal_handler": [
+          1305
+        ],
+        "authentication": [
+          1066
+        ],
+        "add_request_id": [
+          1085
+        ],
+        "log_response": [
+          1098
+        ],
+        "_force_log": [
+          120
+        ],
+        "_cleanup_ipc_path": [
+          267
+        ]
+      }
+    },
+    "benchmarks/benchmark_serving.py": {
+      "sha256": "9f98954f41f4a5e0db64c1929d119e6218487248840dabd79c84dae96af88595",
+      "lf_sha256": "48f71d043287c1514c8d0f5b5be008e692029c6bea058c58a1dd7f92313d990b",
+      "anchors": {
+        "BenchmarkMetrics": [
+          82
+        ],
+        "get_request": [
+          111
+        ],
+        "calculate_metrics": [
+          156
+        ],
+        "benchmark": [
+          274
+        ],
+        "check_goodput_args": [
+          539
+        ],
+        "parse_goodput": [
+          561
+        ],
+        "save_to_pytorch_benchmark_format": [
+          577
+        ],
+        "main": [
+          612
+        ],
+        "limited_request_func": [
+          376
+        ],
+        "process_one_metric": [
+          490
+        ]
+      }
+    },
+    "benchmarks/backend_request_func.py": {
+      "sha256": "c2ea6adfe83f653542c4c39c6a43517f7df4a6ac055df410f54aa9dddabbd359",
+      "lf_sha256": "8cacafacb8ab1f95372b9366be2c1cfa805329d9695a3f8840cae44d3bd247c4",
+      "anchors": {
+        "RequestFuncInput": [
+          25
+        ],
+        "RequestFuncOutput": [
+          42
+        ],
+        "async_request_tgi": [
+          54
+        ],
+        "async_request_trt_llm": [
+          130
+        ],
+        "async_request_deepspeed_mii": [
+          196
+        ],
+        "async_request_openai_completions": [
+          257
+        ],
+        "async_request_openai_chat_completions": [
+          362
+        ],
+        "async_request_openai_audio": [
+          455
+        ],
+        "get_model": [
+          562
+        ],
+        "get_tokenizer": [
+          581
+        ],
+        "to_bytes": [
+          491
+        ]
+      }
+    },
+    "benchmarks/mixed_workload_dataset.py": {
+      "sha256": "a53f2d60ab509d7b384239902e001c2b236cf73a9e2c3a6c3710fde18d2f48ff",
+      "lf_sha256": "a53f2d60ab509d7b384239902e001c2b236cf73a9e2c3a6c3710fde18d2f48ff",
+      "anchors": {
+        "add_mixed_dataset_args": [
+          33
+        ],
+        "mixed_dataset_from_args": [
+          63
+        ],
+        "_hash": [
+          78
+        ],
+        "MixedSampleRequest": [
+          83
+        ],
+        "MixedWorkloadDataset": [
+          87
+        ],
+        "__init__": [
+          94
+        ],
+        "validate_num_requests": [
+          122
+        ],
+        "load_data": [
+          130
+        ],
+        "_require": [
+          183
+        ],
+        "_rows": [
+          190
+        ],
+        "_exclude": [
+          223
+        ],
+        "_duplicate": [
+          229
+        ],
+        "_input": [
+          236
+        ],
+        "_max_tokens": [
+          278
+        ],
+        "sample": [
+          306
+        ],
+        "_distribution": [
+          463
+        ],
+        "report": [
+          482
+        ],
+        "print_inspection": [
+          521
+        ],
+        "export": [
+          538
+        ],
+        "percentile": [
+          468
+        ]
+      }
+    },
+    "vllm/v1/engine/parallel_sampling.py": {
+      "sha256": "46215b0fc06f890aa4b78bb421dc488e032a5f255578c95d08d0e8abd63fbad9",
+      "lf_sha256": "b95885687e4d1713107d6073f2b39d459e5e21bfd91cc949bb7682ba1ab64c83",
+      "anchors": {
+        "ParentRequest": [
+          12
+        ],
+        "__init__": [
+          34
+        ],
+        "_get_child_sampling_params": [
+          46
+        ],
+        "get_child_info": [
+          77
+        ],
+        "n": [
+          91
+        ],
+        "get_outputs": [
+          94
+        ],
+        "observe_num_generation_tokens": [
+          113
+        ],
+        "observe_finished_request": [
+          119
+        ]
+      }
+    }
+  },
+  "repository": "https://github.com/scaramouch15/vllm091",
+  "path_base": "repository root; runtime comparison resolves paths from imported vllm.__file__",
+  "hash_policy": "lf_sha256 is canonical for cross-platform runtime-source comparison; sha256 records the original audit checkout bytes"
+}
