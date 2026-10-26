@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools/r1_shadow"))
 import check_ipc as C
+import repro_ipc_exit as R
 
 EXPECTED = {"request_id": "ordinary-shadow-ipc-id", "tokens": 2, "lengths": None}
 
@@ -53,17 +54,19 @@ def fake_modules(cuda=False, decode_error=False, missing_ecr=False):
     modules["vllm.v1.serial_utils"].MsgpackEncoder = Encoder
     modules["vllm.sampling_params"].SamplingParams = lambda **kw: types.SimpleNamespace(**kw)
     modules["torch"].cuda = types.SimpleNamespace(is_initialized=lambda: cuda)
+    modules["torch"].__version__ = "fixture"
     return modules
 
 
-def fixture_actual_child(incoming, outgoing, case_id, directory, deadline):
+def fixture_actual_child(incoming, outgoing, case_id, directory, deadline,
+                         exit_stack_timeout=C.EXIT_STACK_TIMEOUT):
     # Exercise the actual child body, with deliberately fake dependency/codec
     # modules installed only in this newly spawned test process.
     sys.modules.update(fake_modules())
-    C.child(incoming, outgoing, case_id, directory, deadline)
+    C.child(incoming, outgoing, case_id, directory, deadline, exit_stack_timeout)
 
 
-def fixture_hang(incoming, outgoing, case_id, directory, deadline):
+def fixture_hang(incoming, outgoing, case_id, directory, deadline, exit_stack_timeout=None):
     events = C.Events(directory, "child", case_id)
     events.emit("fixture.child_started")
     guard = C.Stacks(Path(directory) / f"{case_id}.child.stacks.log", deadline)
@@ -72,23 +75,49 @@ def fixture_hang(incoming, outgoing, case_id, directory, deadline):
         time.sleep(.05)
 
 
-def fixture_exit(incoming, outgoing, case_id, directory, deadline):
+def fixture_exit(incoming, outgoing, case_id, directory, deadline, exit_stack_timeout=None):
     events = C.Events(directory, "child", case_id)
     events.emit("fixture.exit_7.before")
     os._exit(7)
 
 
-def fixture_result_nonzero(incoming, outgoing, case_id, directory, deadline):
+def fixture_result_nonzero(incoming, outgoing, case_id, directory, deadline,
+                           exit_stack_timeout=None):
     outgoing.send({"kind": "result", "value": pickle.loads(incoming[0])})
     outgoing.close()
     os._exit(9)
 
 
-def fixture_result_then_hang(incoming, outgoing, case_id, directory, deadline):
+def fixture_result_then_hang(incoming, outgoing, case_id, directory, deadline,
+                             exit_stack_timeout=None):
     outgoing.send({"kind": "result", "value": pickle.loads(incoming[0])})
     outgoing.close()
     while True:
         time.sleep(.05)
+
+
+def fixture_target_exit_then_shutdown_hangs(incoming, outgoing, case_id, directory,
+                                             deadline, exit_stack_timeout):
+    """Model a target return followed by a stuck multiprocessing finalizer."""
+    sys.modules.update(fake_modules())
+    C.child(incoming, outgoing, case_id, directory, deadline, exit_stack_timeout)
+
+    def shutdown_finalizer_blocks():
+        while True:
+            time.sleep(.01)
+
+    # multiprocessing runs this after the target returns. child.target_exit is
+    # already flushed at that point, matching a post-target shutdown hang.
+    from multiprocessing.util import Finalize
+    Finalize(None, shutdown_finalizer_blocks, exitpriority=0)
+
+
+def fixture_isolation_child(incoming, outgoing, case_id, directory, deadline,
+                            exit_stack_timeout, mode):
+    if mode != "pure_spawn":
+        sys.modules.update(fake_modules())
+    R.isolated_child(incoming, outgoing, case_id, directory, deadline,
+                     exit_stack_timeout, mode)
 
 
 class IPCTests(unittest.TestCase):
@@ -111,6 +140,7 @@ class IPCTests(unittest.TestCase):
             self.assertTrue(record["passed"])
             self.assertEqual(record["actual"], expected)
             self.assertEqual(record["child_exitcode"], 0)
+            self.assertEqual(record["exit_timeout_seconds"], 10.)
             self.assertFalse(record["child_alive_after_cleanup"])
             self.assertTrue(record["cleanup"]["complete"])
             self.assertEqual(record["cleanup"]["actions"], [])
@@ -126,6 +156,21 @@ class IPCTests(unittest.TestCase):
                 names = [r["stage"] for r in rows]
                 self.assertIn("child." + stage + ".before", names)
                 self.assertIn("child." + stage + ".after", names)
+            self.assertLess(names.index("child.exit_watchdog_ready"),
+                            names.index("child.send_result.after"))
+
+    def test_isolation_repro_distinguishes_spawn_imports_and_real_ipc(self):
+        for mode in ("pure_spawn", "imports_torch_vllm", "actual_ecr_ipc"):
+            case_id = "isolate_" + mode
+            record = {"case_id": case_id}
+            C.run_case(self.context, lambda: [pickle.dumps(EXPECTED)], EXPECTED,
+                       record, self.out, 5., target=fixture_isolation_child,
+                       target_args=(mode,))
+            self.assertTrue(record["passed"], mode)
+            self.assertEqual(record["actual"], EXPECTED)
+            self.assertEqual(record["child_exitcode"], 0)
+            self.assertEqual(record["child_last_known_stage"]["last_event"]["stage"],
+                             "child.target_exit")
 
     def test_real_spawn_timeout_keeps_case_stage_stacks_and_reaps(self):
         record = {"case_id": "timeout"}
@@ -169,6 +214,29 @@ class IPCTests(unittest.TestCase):
                        self.out, 5., target=fixture_result_then_hang)
         self.assertFalse(record["passed"])
         self.assertEqual(record["actual"], EXPECTED)
+        self.assertTrue(record["cleanup"]["reaped"])
+
+    def test_target_exit_watchdog_captures_post_target_shutdown_hang(self):
+        record = {"case_id": "target_exit_hang"}
+        with patch.object(C, "EXIT_TIMEOUT", .4), \
+             patch.object(C, "EXIT_STACK_TIMEOUT", .05), \
+             patch.object(C, "STACK_GRACE", .1), \
+             self.assertRaises(C.ChildExitTimeout):
+            C.run_case(self.context, lambda: [pickle.dumps(EXPECTED)], EXPECTED,
+                       record, self.out, 5., target=fixture_target_exit_then_shutdown_hangs)
+
+        self.assertFalse(record["passed"])
+        self.assertEqual(record["actual"], EXPECTED)
+        self.assertGreaterEqual(record["exit_wait_elapsed_seconds"], .4)
+        self.assertEqual(record["exit_timeout_seconds"], .4)
+        self.assertEqual(record["exit_stack_timeout_seconds"], .05)
+        self.assertEqual(C.EXIT_TIMEOUT, 10.)
+        self.assertEqual(record["child_last_known_stage"]["last_event"]["stage"],
+                         "child.target_exit")
+        self.assertTrue(record["child_stack"]["available"])
+        stack_text = (self.out / "target_exit_hang.child.stacks.log").read_text()
+        self.assertIn("shutdown_finalizer_blocks", stack_text)
+        self.assertFalse(record["child_alive_after_cleanup"])
         self.assertTrue(record["cleanup"]["reaped"])
 
     def test_blocked_frame_reader_cannot_defeat_parent_wait_deadline(self):

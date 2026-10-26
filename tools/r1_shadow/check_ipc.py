@@ -22,6 +22,10 @@ import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
 EXIT_TIMEOUT = 10.0
+# Capture a child that is still alive in Python's post-target shutdown before
+# the parent's fixed EXIT_TIMEOUT expires. This is diagnostic timing only; it
+# does not change the required normal exitcode=0 check.
+EXIT_STACK_TIMEOUT = 5.0
 CLEANUP_TIMEOUT = 5.0
 READER_JOIN_TIMEOUT = 1.0
 STACK_GRACE = 0.25
@@ -131,8 +135,27 @@ class Stacks:
                 self.errors.append(exception_record(exc))
 
 
-def child(incoming, outgoing, case_id, directory, stack_deadline):
+def child(incoming, outgoing, case_id, directory, stack_deadline,
+          exit_stack_timeout=EXIT_STACK_TIMEOUT):
     events = stacks = None
+    exit_watchdog_armed = False
+
+    def keep_exit_watchdog():
+        nonlocal exit_watchdog_armed
+        global _CHILD_EXIT_STACKS
+        if stacks is None or exit_watchdog_armed:
+            return
+        # Arm before sending a terminal response. The parent cannot begin its
+        # exit join until after receiving that response, leaving a bounded
+        # diagnostic window before the unchanged exit timeout.
+        stacks.arm(time.monotonic() + exit_stack_timeout)
+        _CHILD_EXIT_STACKS = stacks
+        exit_watchdog_armed = True
+        if events is not None:
+            events.safely("child.exit_watchdog_ready", armed=stacks.armed,
+                          timeout_seconds=exit_stack_timeout,
+                          errors=stacks.errors)
+
     try:
         events = Events(directory, "child", case_id)
         events.emit("child.started")
@@ -168,6 +191,7 @@ def child(incoming, outgoing, case_id, directory, stack_deadline):
         value = {"request_id": native.request_id, "tokens": native.num_prompt_tokens,
                  "lengths": native.r1_shadow_lengths}
         events.emit("child.send_result.before")
+        keep_exit_watchdog()
         outgoing.send({"kind": "result", "value": value})
         events.emit("child.send_result.after")
     except BaseException as exc:
@@ -177,6 +201,7 @@ def child(incoming, outgoing, case_id, directory, stack_deadline):
             events.safely("child.exception", exception=error,
                           last_known_event_at_exception=last_event)
         try:
+            keep_exit_watchdog()
             outgoing.send({"kind": "error", "exception": error,
                            "last_known_event_at_exception": last_event})
         except BaseException as send_exc:
@@ -186,12 +211,7 @@ def child(incoming, outgoing, case_id, directory, stack_deadline):
         if stacks is not None:
             # Keep the file and watchdog alive through Python/library atexit.
             # Closing it here would hide a hang after a successful send.
-            stacks.arm(time.monotonic() + EXIT_TIMEOUT)
-            global _CHILD_EXIT_STACKS
-            _CHILD_EXIT_STACKS = stacks
-            if events is not None:
-                events.safely("child.exit_watchdog_ready", armed=stacks.armed,
-                              timeout_seconds=EXIT_TIMEOUT, errors=stacks.errors)
+            keep_exit_watchdog()
         outgoing.close()
         if events is not None:
             events.safely("child.target_exit")
@@ -301,23 +321,30 @@ def json_value(value):
         return {"unserializable_type": type(value).__name__, "repr": repr(value)[:4096]}
 
 
-def run_case(context, encode, expected, record, directory, timeout, target=child):
-    """Retain failures. Target injection is solely for standard-library tests."""
+def run_case(context, encode, expected, record, directory, timeout, target=child,
+             target_args=()):
+    """Retain failures; target injection supports isolation diagnostics/tests."""
     case_id = record["case_id"]
     events = Events(directory, "parent", case_id)
     started = time.monotonic()
     stacks = Stacks(Path(directory) / f"{case_id}.parent.stacks.log", started + timeout)
     process = receive = send = reader = None
     failure = None
+    child_exit_stack_timeout = min(EXIT_STACK_TIMEOUT,
+                                   max(0.01, EXIT_TIMEOUT - STACK_GRACE - 0.1))
     record.update(passed=False, expected=expected, wait_timeout_seconds=timeout,
-                  wait_elapsed_seconds=None, child_pid=None, process_start_returned=False)
+                  wait_elapsed_seconds=None, exit_timeout_seconds=EXIT_TIMEOUT,
+                  exit_stack_timeout_seconds=child_exit_stack_timeout,
+                  exit_wait_elapsed_seconds=None, child_pid=None,
+                  process_start_returned=False)
     try:
         events.emit("parent.encode.before")
         buffers = encode()
         events.emit("parent.encode.after", buffer_bytes=sum(len(b) for b in buffers))
         receive, send = context.Pipe(duplex=False)
         process = context.Process(target=target,
-            args=(buffers, send, case_id, str(directory), started + timeout))
+            args=(buffers, send, case_id, str(directory), started + timeout,
+                  child_exit_stack_timeout, *target_args))
         events.emit("parent.start.before")
         process.start()
         record.update(child_pid=process.pid, process_start_returned=True)
@@ -364,9 +391,13 @@ def run_case(context, encode, expected, record, directory, timeout, target=child
         record["actual"] = json_value(actual)
         if actual != expected:
             raise RuntimeError("round-trip mismatch: " + repr(actual))
-        events.emit("parent.exit_check.before", timeout_seconds=EXIT_TIMEOUT)
+        exit_waiting = time.monotonic()
+        events.emit("parent.exit_check.before", timeout_seconds=EXIT_TIMEOUT,
+                    child_stack_timeout_seconds=child_exit_stack_timeout)
         process.join(timeout=EXIT_TIMEOUT)
-        events.emit("parent.exit_check.after", alive=process.is_alive(), exitcode=process.exitcode)
+        record["exit_wait_elapsed_seconds"] = time.monotonic() - exit_waiting
+        events.emit("parent.exit_check.after", alive=process.is_alive(), exitcode=process.exitcode,
+                    wait_elapsed_seconds=record["exit_wait_elapsed_seconds"])
         if process.is_alive():
             raise ChildExitTimeout("child did not close within exit timeout")
         if process.exitcode != 0:

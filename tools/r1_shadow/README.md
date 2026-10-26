@@ -156,6 +156,42 @@ set -e 保证任何前置检查失败即停止；保留已打印输出目录和�
 
 `--timeout`是每项父进程开始等待**完整结果消息**后的功能验收上限，默认60秒；正有限数才合法。下面300秒只是诊断等待上限，包含新进程导入/调度/处理等多项因素，**不是在线IPC开销**。父进程另有10秒正常退出检查；超时栈刷新宽限0.25秒；清理terminate最多join5秒，仍存活则kill再join5秒；接收线程join最多1秒。延长结果等待上限不改变正常退出或回收要求。
 
+#### 子进程退出竞争与最小CPU隔离复现
+
+当前源码可以确认一个栈证据竞争：原 `child()` 在结果已发送后才设置退出 watchdog，期限为10秒；父进程从收到结果起等待10秒，最多再留0.25秒栈刷新宽限，然后开始清理。如果父进程先收到结果、子进程稍后才设置 watchdog，且进程在 multiprocessing/bootstrap/atexit 阶段阻塞，父进程可能在 watchdog 到期前终止它，栈文件就会是空的。`child.target_exit` 证明 target 函数已走到末尾，不证明子进程已退出；现有 g03 证据不能确定卡在具体哪个退出回调。
+
+修正后子进程在发送终态结果前启用退出阶段的一次性栈 watchdog，计划5秒后转储；父进程只能在结果送达后开始固定10秒退出检查，预留约5秒诊断窗口，实际触发时刻仍受操作系统调度影响。父进程10秒退出要求、`exitcode == 0` 检查和失败条件不变。若进程及时退出，watchdog 随进程结束，不产生独立诊断进程。`ipc.json` 增加实际退出等待时长、退出检查上限和子进程退出栈转储期限。结果消息正确但子进程未正常退出仍判失败。
+
+`repro_ipc_exit.py` 按顺序运行三个独立 CPU 子进程：纯 `spawn`（子进程不导入 torch/vLLM）、子进程只导入 torch/vLLM 并检查 CUDA 尚未初始化、完整 ECR→Msgpack→Request 路径。每项独立记录父子阶段、导入/等待时长、退出码与栈文件；完整路径复用 `check_ipc.child()` 和相同的身份/数字比对及正常退出门槛。它不加载模型权重、不发 HTTP 请求，也不测在线 IPC 开销。建议在目标服务解释器中用新目录运行：
+
+```bash
+set -euo pipefail
+test -x "${R1_SERVICEPY:?请先source已核实的paths.sh}"
+git -C "$HOME/whb/vllm091" fetch origin review/r1-shadow-ipc-exit-20261026
+R1_EXIT_SHA="$(git -C "$HOME/whb/vllm091" rev-parse origin/review/r1-shadow-ipc-exit-20261026)"
+R1_EXIT_SOURCE="$(mktemp -d "$HOME/whb/r1_ipc_exit_source.XXXXXX")"
+git -C "$HOME/whb/vllm091" worktree add --detach "$R1_EXIT_SOURCE/source" "$R1_EXIT_SHA"
+cd "$R1_EXIT_SOURCE/source"
+R1_EXIT_DIAG="$(mktemp -d "$HOME/whb/r1_ipc_exit_repro.XXXXXX")"
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+if "$R1_SERVICEPY" -B tools/r1_shadow/repro_ipc_exit.py \
+    --out "$R1_EXIT_DIAG/result" --timeout 60 \
+    > "$R1_EXIT_DIAG/console.log" 2>&1; then
+  R1_EXIT_CODE=0
+else
+  R1_EXIT_CODE=$?
+fi
+printf 'source_commit=%s\nexit_code=%s\noutput=%s\n' \
+  "$R1_EXIT_SHA" "$R1_EXIT_CODE" "$R1_EXIT_DIAG"
+cat "$R1_EXIT_DIAG/result/ipc_exit_repro.json"
+```
+
+三个隔离项能区分问题发生在一般 spawn 退出、torch/vLLM 导入后的退出，还是实际 ECR/Request 子进程路径；单次成功/失败只定位到这一层，不能单凭延长结果等待后通过推断此前一定是导入慢。CPU 隔离结果也不等于已复现 g03 当时的退出阻塞。若复现仍只见 `child.target_exit`、但栈为空，需保留完整 JSONL、父子 stacks 和退出码继续审查；不得把收到结果算作通过。
+
+输出目录包含 `ipc_exit_repro.json` 汇总、每个 case 的 parent/child 阶段和栈文件；完整 IPC case 另有 `actual_ecr_ipc.parent_import.stages.jsonl`，记录编码端导入与编码阶段。汇总保留每项是否通过、结果等待和退出等待时长、exitcode、最后完整子进程阶段、清理状态及栈文件是否非空。
+
 为避免poll后的recv遇到部分帧而无界阻塞，recv放在单个daemon reader线程，主线程使用有截止时间的队列等待。失败时仍关闭Pipe两端、terminate/kill并回收所属子进程，所有显式join有上限。仅在极端OS状态下kill仍不能回收时，先写出失败JSON、标注未回收，再退出诊断器以避免multiprocessing解释器结束时的隐式无界join；这不是“回收成功”，需按报告中的PID另外核查。若start未返回且无PID/handle，状态为unknown，不声称进程已回收。OS级start、文件I/O或第三方模块导入本身不能由Python等待参数保证硬实时终止，watchdog可尽量留下栈，不额外启动调试器或引入新的无限等待。
 
 阶段日志每行含monotonic_ns、该进程/该case的elapsed_seconds、PID、case_id、role和stage，写入专用JSONL后立即flush，并flush镜像到console。child覆盖入口、ECR/Request/Decoder/Torch实际导入前后（隐式依赖归在相应外层导入区间）、decode、Request构造、CUDA检查、发送和target结束；parent覆盖本地导入、编码、start、等待、收到消息、退出检查及清理。
@@ -163,7 +199,7 @@ set -e 保证任何前置检查失败即停止；保留已打印输出目录和�
 - `setup.parent.stages.jsonl`：父进程前置导入/最终CUDA检查；`none.*`、`three_lengths.*`：各case的parent/child阶段与stacks文件。
 - 子进程在target入口安装一次性faulthandler watchdog，使用同机monotonic诊断截止时间；成功发送后保留文件和退出watchdog至进程真正退出，用于观察target返回后的atexit阻塞。不发送可能未注册的信号，也不周期性无限dump。父进程仅在setup/启动阶段使用自动watchdog，进入有界结果等待前将其取消；结果/退出等待超时时由主线程同步dump自身全部线程（含reader）栈，避免自动/手动转储在异常处理期间并发。
 - 辅助watchdog从setup/case开始计时，可能比结果等待上限更早输出栈；栈文件存在本身不是超时或根因结论。子进程若卡在target入口之前，无法靠target内的watchdog得到其栈；报告标注无child阶段/无栈证据，不能据此判断具体bootstrap阻塞点。
-- `ipc.json.cases`在每项开始前保留记录，失败也不删除。包括passed、exception/traceback、wait_timeout_seconds、实际wait_elapsed_seconds、child_pid/exitcode、是否仍活着、cleanup动作/错误/reaped、父子栈可用性。
+- `ipc.json.cases`在每项开始前保留记录，失败也不删除。包括passed、exception/traceback、wait_timeout_seconds、实际wait_elapsed_seconds、exit_timeout_seconds、实际exit_wait_elapsed_seconds、exit_stack_timeout_seconds、child_pid/exitcode、是否仍活着、cleanup动作/错误/reaped、父子栈可用性。
 - `child_stage_at_timeout`是采取清理动作前读取的阶段快照；`child_last_known_stage`是清理后的最后记录。两者仅来自对应child JSONL的**最后一条完整JSON行**，校验case/role/PID，最多读取1MiB，忽略未完成尾行。缺文件/身份不符等返回verified=false/last_event=null。它们不依赖stdout行顺序或跨进程时钟猜测。`child.target_exit`只说明target走到结束，不代表进程已正常退出，必须看exitcode/cleanup。child响应中的原异常及异常时最后刷新的阶段另行保留，不被发送/清理的第二个错误覆盖。
 
 先从GitHub取**新工具提交**并创建新worktree，不覆盖仍保留的旧源码或失败目录。先source上一轮实际paths.sh取得已核实的R1_SERVICEPY；不重新克隆环境、不安装依赖，也不需要因本次工具修正重训/重跑已通过的1440条验证：
@@ -217,7 +253,7 @@ printf '回传压缩包及小写.sha256：%s\n' "$R1_IPC_DELIVERY"
 
 本地优化模式曾观察到自动/手动栈转储交错并伴随原生访问异常，失败日志保留在仓库外；增加取消watchdog后再手动dump的顺序保护，父进程有界等待阶段只保留主线程超时转储，并补充回归测试。该本地事件不是服务器原超时根因的证据。
 
-本地新增标准库测试使用真实spawn/Pipe和合成依赖/codec，覆盖正常两项、结果等待超时、异常退出、发送正确结果后异常退出/不退出、阻塞reader、start失败、kill兜底、原错与次要清理错误、阶段来源、CUDA拒绝及失败JSON。它们验证诊断/资源生命周期，**不是本地真实vLLM/torch/Msgpack共存验证**；服务器实际导入/编解码及此次超时根因仍待新材料定位。
+本地新增标准库测试使用真实spawn/Pipe和合成依赖/codec，覆盖正常两项、纯spawn/依赖导入/完整IPC隔离、结果等待超时、异常退出、发送正确结果后异常退出/不退出、target返回后multiprocessing退出清理阻塞及栈保留、阻塞reader、start失败、kill兜底、原错与次要清理错误、阶段来源、CUDA拒绝及失败JSON。它们验证诊断/资源生命周期，**不是本地真实vLLM/torch/Msgpack共存验证**；真实 g03 退出阻塞点仍待服务器按上面的隔离命令复现定位。
 
 ### 后续服务验收（IPC通过后另行执行）
 
