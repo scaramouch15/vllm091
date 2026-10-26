@@ -146,6 +146,81 @@ set -e 保证任何前置检查失败即停止；保留已打印输出目录和�
 
 上面验证实际 shadow 函数，全部1440记录按身份/顺序对照 B 自己保存的长度/时长预测，rtol=atol=1e-10，并检验1/8/32/64/128批量路径。失败停止，不放宽容差。check_ipc 用真实 ECR/原生 MsgpackEncoder/Decoder，经 spawn 子进程→Request，比对缺省与数字字段；不是实际 ZMQ/LLM 请求验收。
 
+### IPC 超时诊断重跑（先回传，不启动服务）
+
+用户提供的服务器证据：在 `542fc998b9a22b87b93c7820c1327baa7b5fe8b6` 上，Python3.10.22、vLLM0.9.1、实际源码路径及shadow runtime全部1440条B模型一致性检查已通过；IPC第一项在等待60秒时失败。旧 `cases=[]` 只说明没有一项完整通过，第一项是None，不能归因于新增三个预测数字。没有阶段/栈证据时，模块导入、spawn启动、编解码阻塞等仅是待验证假设；NCCL警告不是已确认原因。300秒通过也不能证明原来一定是导入缓慢。
+
+**源码已确认的旧工具缺口**：case只在成功后追加；start在清理try之外；poll只表示有字节/EOF，后续recv仍可能等不完整帧；仅terminate/join5秒，没有kill兜底、最终存活核对或进程句柄关闭。它们是工具可确认的问题，**不是此次poll超时的已确认根因**，特别是不完整帧问题不能解释已观察到的poll返回超时。
+
+本版仍强制spawn，顺序检查None及(1.,2.,3.)，逐项核对原request_id/token数/数字值、正常exitcode=0，以及子进程和父进程CUDA未初始化。不跳过子进程、不换fork、不放宽通过标准。child路径也核对实际导入vLLM源码位置。
+
+`--timeout`是每项父进程开始等待**完整结果消息**后的功能验收上限，默认60秒；正有限数才合法。下面300秒只是诊断等待上限，包含新进程导入/调度/处理等多项因素，**不是在线IPC开销**。父进程另有10秒正常退出检查；超时栈刷新宽限0.25秒；清理terminate最多join5秒，仍存活则kill再join5秒；接收线程join最多1秒。延长结果等待上限不改变正常退出或回收要求。
+
+为避免poll后的recv遇到部分帧而无界阻塞，recv放在单个daemon reader线程，主线程使用有截止时间的队列等待。失败时仍关闭Pipe两端、terminate/kill并回收所属子进程，所有显式join有上限。仅在极端OS状态下kill仍不能回收时，先写出失败JSON、标注未回收，再退出诊断器以避免multiprocessing解释器结束时的隐式无界join；这不是“回收成功”，需按报告中的PID另外核查。若start未返回且无PID/handle，状态为unknown，不声称进程已回收。OS级start、文件I/O或第三方模块导入本身不能由Python等待参数保证硬实时终止，watchdog可尽量留下栈，不额外启动调试器或引入新的无限等待。
+
+阶段日志每行含monotonic_ns、该进程/该case的elapsed_seconds、PID、case_id、role和stage，写入专用JSONL后立即flush，并flush镜像到console。child覆盖入口、ECR/Request/Decoder/Torch实际导入前后（隐式依赖归在相应外层导入区间）、decode、Request构造、CUDA检查、发送和target结束；parent覆盖本地导入、编码、start、等待、收到消息、退出检查及清理。
+
+- `setup.parent.stages.jsonl`：父进程前置导入/最终CUDA检查；`none.*`、`three_lengths.*`：各case的parent/child阶段与stacks文件。
+- 子进程在target入口安装一次性faulthandler watchdog，使用同机monotonic诊断截止时间；成功发送后保留文件和退出watchdog至进程真正退出，用于观察target返回后的atexit阻塞。不发送可能未注册的信号，也不周期性无限dump。父进程仅在setup/启动阶段使用自动watchdog，进入有界结果等待前将其取消；结果/退出等待超时时由主线程同步dump自身全部线程（含reader）栈，避免自动/手动转储在异常处理期间并发。
+- 辅助watchdog从setup/case开始计时，可能比结果等待上限更早输出栈；栈文件存在本身不是超时或根因结论。子进程若卡在target入口之前，无法靠target内的watchdog得到其栈；报告标注无child阶段/无栈证据，不能据此判断具体bootstrap阻塞点。
+- `ipc.json.cases`在每项开始前保留记录，失败也不删除。包括passed、exception/traceback、wait_timeout_seconds、实际wait_elapsed_seconds、child_pid/exitcode、是否仍活着、cleanup动作/错误/reaped、父子栈可用性。
+- `child_stage_at_timeout`是采取清理动作前读取的阶段快照；`child_last_known_stage`是清理后的最后记录。两者仅来自对应child JSONL的**最后一条完整JSON行**，校验case/role/PID，最多读取1MiB，忽略未完成尾行。缺文件/身份不符等返回verified=false/last_event=null。它们不依赖stdout行顺序或跨进程时钟猜测。`child.target_exit`只说明target走到结束，不代表进程已正常退出，必须看exitcode/cleanup。child响应中的原异常及异常时最后刷新的阶段另行保留，不被发送/清理的第二个错误覆盖。
+
+先从GitHub取**新工具提交**并创建新worktree，不覆盖仍保留的旧源码或失败目录。先source上一轮实际paths.sh取得已核实的R1_SERVICEPY；不重新克隆环境、不安装依赖，也不需要因本次工具修正重训/重跑已通过的1440条验证：
+
+```bash
+set -euo pipefail
+test -x "${R1_SERVICEPY:?请先source原验收目录的paths.sh，取得实际解释器路径}"
+git -C "$HOME/whb/vllm091" fetch origin review/r1-shadow-20261025
+R1_IPC_SHA="$(git -C "$HOME/whb/vllm091" rev-parse origin/review/r1-shadow-20261025)"
+R1_IPC_SOURCE="$(mktemp -d "$HOME/whb/r1_ipc_source.XXXXXX")"
+git -C "$HOME/whb/vllm091" worktree add --detach "$R1_IPC_SOURCE/source" "$R1_IPC_SHA"
+cd "$R1_IPC_SOURCE/source"
+R1_IPC_DIAG="$(mktemp -d "$HOME/whb/r1_ipc_diag.XXXXXX")"
+printf 'source_commit=%s\npython=%s\nsource=%s\n' \
+  "$R1_IPC_SHA" "$R1_SERVICEPY" "$PWD" > "$R1_IPC_DIAG/source.txt"
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+# result必须不存在；保留原ipc/和ipc.log，不覆盖。
+if "$R1_SERVICEPY" -B tools/r1_shadow/check_ipc.py \
+    --out "$R1_IPC_DIAG/result" --timeout 300 \
+    > "$R1_IPC_DIAG/console.log" 2>&1; then
+  R1_IPC_CODE=0
+else
+  R1_IPC_CODE=$?
+fi
+printf 'exit_code=%s\n' "$R1_IPC_CODE" | tee "$R1_IPC_DIAG/exit_code.txt"
+printf '诊断目录：%s\n' "$R1_IPC_DIAG"
+if test -f "$R1_IPC_DIAG/result/ipc.json"; then
+  cat "$R1_IPC_DIAG/result/ipc.json"
+fi
+# 成功/失败均先回传；失败不继续启动服务。
+```
+
+新的`--out`存在会报错，原失败材料不被删除或覆盖。异常杀死父进程可能来不及写最终ipc.json，已flush的独立阶段/栈文件仍应保留，不能据缺JSON宣称检查完成。
+
+打包新诊断及原失败JSON供私下回传（不打入模型、环境或验证数据）：
+
+```bash
+read -r -p '原失败ipc.json所在目录的实际绝对路径：' R1_IPC_PREVIOUS
+test -f "$R1_IPC_PREVIOUS/ipc.json"
+R1_IPC_DELIVERY="$(mktemp -d "$HOME/whb/r1_ipc_delivery.XXXXXX")"
+mkdir "$R1_IPC_DELIVERY/original_failure"
+cp -p -- "$R1_IPC_PREVIOUS/ipc.json" "$R1_IPC_DELIVERY/original_failure/ipc.json"
+tar -czf "$R1_IPC_DELIVERY/r1_ipc_diagnostics.tar.gz" \
+  -C "$R1_IPC_DELIVERY" original_failure \
+  -C "$(dirname "$R1_IPC_DIAG")" "$(basename "$R1_IPC_DIAG")"
+(cd "$R1_IPC_DELIVERY" && sha256sum r1_ipc_diagnostics.tar.gz > r1_ipc_diagnostics.tar.gz.sha256)
+printf '回传压缩包及小写.sha256：%s\n' "$R1_IPC_DELIVERY"
+```
+
+本地优化模式曾观察到自动/手动栈转储交错并伴随原生访问异常，失败日志保留在仓库外；增加取消watchdog后再手动dump的顺序保护，父进程有界等待阶段只保留主线程超时转储，并补充回归测试。该本地事件不是服务器原超时根因的证据。
+
+本地新增标准库测试使用真实spawn/Pipe和合成依赖/codec，覆盖正常两项、结果等待超时、异常退出、发送正确结果后异常退出/不退出、阻塞reader、start失败、kill兜底、原错与次要清理错误、阶段来源、CUDA拒绝及失败JSON。它们验证诊断/资源生命周期，**不是本地真实vLLM/torch/Msgpack共存验证**；服务器实际导入/编解码及此次超时根因仍待新材料定位。
+
+### 后续服务验收（IPC通过后另行执行）
+
 在已获准 GPU 节点，CPU 两项先通过后，服务终端设置（先检查模型路径、端口可用；本轮只给命令）：
 
 ```bash
@@ -208,13 +283,14 @@ printf '回传：%s\n' "$R1_DELIVERY"
 
 本地现有 Python3.12，仅使用标准库及已有 NumPy；不安装包、不读取训练/测试数据、不加载真实 B 模型。轻量测试执行实际 Completion、Processor、Request、Scheduler 方法（AST加载，资源 stub），比较运行基线与 shadow开/关调度输出、KV调用、事件/状态和队列，覆盖静态次数/空白、字段门禁、伪造值、失败回退、首次/恢复/取消、共享数值快照和有界扫描。已有采集器及 mixed 回归继续执行。采集器原“整个IPC文件不变”断言仅调整为保护原有字段，显式允许新增尾部可选字段。
 
-本次追加修正的本地结果：shadow 28项正常模式通过、28项 `-O` 通过；采集器34项通过（含单类 mixed 保护）。新增测试用可控时钟验证完整区间包含emit、成功/失败/空候选/间隔跳过各自计数、按实际候选规模分组、丢弃日志仍聚合、无递归emit、桶边界/合并/固定存储与缺失分位数。真实原生调度输出与队列/KV调用不变的既有测试继续运行。Python3.10语法、五个Bash块语法及git diff检查通过；未执行真实服务。
+前轮前台耗时修正的本地结果：shadow 28项正常模式通过、28项 `-O` 通过；采集器34项通过（含单类 mixed 保护）。新增测试用可控时钟验证完整区间包含emit、成功/失败/空候选/间隔跳过各自计数、按实际候选规模分组、丢弃日志仍聚合、无递归emit、桶边界/合并/固定存储与缺失分位数。真实原生调度输出与队列/KV调用不变的既有测试继续运行。Python3.10语法、五个Bash块语法及git diff检查通过；未执行真实服务。
 
-前轮两个验证CLI的 --help 已通过；本轮未修改这些程序。完整mixed测试在前轮因现有解释器缺pyarrow而导入受阻，本轮未安装依赖或声称其通过。完整日志保存在仓库外，不随源码推送。
+前轮两个验证CLI的 --help 已通过；本轮仅完善check_ipc，validate_cpu未修改。IPC诊断工具另有16项标准库测试（正常模式及-O通过），并检查--help、默认60/诊断300参数、Python3.10语法、当前README七个Bash块及既有服务参数断言。本轮没有改动运行时shadow/调度器。完整mixed测试在前轮因现有解释器缺pyarrow而导入受阻，本轮未安装依赖或声称其通过。完整日志保存在仓库外，不随源码推送。
 
 ```bash
 python -B tests/benchmarks/test_r1_shadow.py -v
 python -B tests/benchmarks/test_request_collector.py -v
+python -B tests/benchmarks/test_r1_shadow_ipc.py -v
 ```
 
-真实 sklearn B artifact 的全部验证预测、真实 Msgpack+spawn、ZMQ/服务端路径、开关后真实GPU输出/吞吐/延迟/批次、取消时序以及长时间队列满与进程异常退出均待服务器验收。兼容工具的23文件哈希记录属于旧运行基线，不能用来声称新 Hook 文件仍与旧基线相同。本分支是待审查实现，不是已经完成的在线实验结论。
+用户已报告服务器shadow runtime全部1440条B预测验证通过；本地没有重复执行真实模型。完善诊断后的真实Msgpack+spawn、此次超时的根因、ZMQ/服务端路径、shadow开关后真实GPU输出/吞吐/延迟/批次、取消时序和长时间压力仍待服务器验收。兼容工具的23文件哈希记录属于旧运行基线，不能用来声称新 Hook 文件仍与旧基线相同。本分支是待审查实现，不是已经完成的在线实验结论。
