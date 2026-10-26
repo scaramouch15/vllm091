@@ -279,6 +279,44 @@ tar -czf "$R1_DELIVERY/r1_shadow_accept.tar.gz" \
 printf '回传：%s\n' "$R1_DELIVERY"
 ```
 
+## CPU writer 后端开销诊断（离线工具）
+
+`diagnose_cpu_overhead.py` 在离线环境比较同一真实 Predictor 和 `Shadow.sweep()` 的两种记录后端。它不启动 API 服务、benchmark、GPU 或调度循环，也不改服务入口和运行时代码。需要使用已经验证的完整 Python 3.10.22 服务环境和 B 模型；工具会由 `Predictor` 核对模型 SHA、Python/包版本和数值线程池。它不需要读取验证集或 prompt。
+
+输入是本轮 shadow 运行生成的 Core `shadow-*.jsonl` 文件。工具从一条真实 `shadow_candidates` 记录取同一时刻的 `running_count`、KV 使用率、token budget 和至少 8 个真实候选。候选规模 1 与 8 使用这条记录中的真实数值输入；32 与 128 循环复用前 8 个数值候选，输出会逐条标记 `synthetic_copy=true`。没有包含至少 8 个候选的原始记录时，工具明确失败，不拼接不同状态时刻的数据。
+
+A 使用真实 `RecordWriter` 的有界队列、后台线程和 JSONL 写出，并检查正常关闭、footer、dropped/error 计数。B 使用诊断内存 sink；它仍执行 `Shadow.emit`、调用方字典构造、字段校验和 `Shadow` 的计时统计，只捕获有界的候选预测投影并直接返回成功，没有队列、后台线程或文件写出。B 不是“完全无日志模式”，也不能声称有完整逐请求日志或线上记录完整。
+
+每个候选规模默认模拟 `every=8` 的调用频率，A/B 使用同一输入与频率。两边先交替预热，再以默认每块 5 个成功预测的方式交替正式测量，块的先后顺序轮换 A/B 和 B/A。冷启动 Predictor 加载时间、A/B writer/sink 初始化时间、预热 sweep 分布和正式 sweep 分布分开记录。每一个 `Shadow.sweep()` 调用（包含 interval skip）都在内存中限量保留；每种规模最多 150 个正式成功预测事件、最多 100 个预热事件，且对 128 候选另设 20,000 条的单条件预测捕获上限。所有逐样本结果在测量结束后写入新建输出目录。
+
+正式 `sweep()` 墙钟时间由调用方用 `perf_counter_ns` 包围函数入口到返回，包含该次调用的候选处理、预测、`Shadow.emit`、调用方记录字典构造及函数内计时统计。JSON 同时保留实现自身 `dynamic_foreground` 分布；它是嵌套区间，且末尾不包含自己的最后一次直方图更新。分位数用 nearest-rank：rank=`ceil(p*n)`，从小到大的一基索引；报告 P50/P95/P99/max，候选规模按实际预测 `candidate_count` 分组，interval skip 使用 `candidate_count=null` 单独报告。A 关闭耗时和后台线程 footer 指标单独保留，不能与前台时间简单相加。
+
+先从以前的 shadow 输出目录选取实际 Core JSONL 文件。下面示例中的占位符要替换为现场已验证的绝对路径；输出目录用 `mktemp` 新建，不覆盖旧结果。必须在导入数值库前设置四个单线程变量，不要对整个服务设置 `taskset`：
+
+```bash
+set -euo pipefail
+R1_SERVICEPY="/absolute/path/to/verified-vllm091-python"
+R1_BMODEL="/absolute/path/to/results/models/tfidf.joblib"
+R1_CORE_JSONL="/absolute/path/to/prior-shadow-run/shadow-core-PID-INSTANCE.jsonl"
+test -x "$R1_SERVICEPY"
+test -f "$R1_BMODEL" -a -f "$R1_CORE_JSONL"
+R1_CPU_DIAG="$(mktemp -d "$HOME/whb/r1_shadow_cpu_diag.XXXXXX")"
+unset PYTHONPATH PYTHONHOME
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+"$R1_SERVICEPY" -B tools/r1_shadow/diagnose_cpu_overhead.py \
+  --model "$R1_BMODEL" --shadow-jsonl "$R1_CORE_JSONL" \
+  --out "$R1_CPU_DIAG/result" --run-id cpu_diag_001 \
+  --every 8 --warmup-sweeps 3 --sweeps 30 --block-size 5 \
+  > "$R1_CPU_DIAG/console.log" 2>&1
+printf 'diagnostic_dir=%s\n' "$R1_CPU_DIAG"
+cat "$R1_CPU_DIAG/result/diagnostic.json"
+```
+
+输出目录包含 `diagnostic.json`、每种规模的 A 组真实 JSONL 及 footer。报告保存脚本/模型和输入 shadow 文件标识、输入行号与 SHA、运行环境、线程池、冷启动、预热/正式样本、A/B 预测逐项一致性、各规模分布和 writer 完整性。它不把候选 ID/数值伪装成原始 prompt，也不复制原始日志到仓库。
+
+该诊断只回答“在此 CPU、此 Predictor、此候选与状态输入下，真实异步 writer 后端和内存 sink 的局部差异”。CPU结果不能直接解释客户端 E2E 增量，也不能证明在线尖峰来自锁、磁盘、GIL或操作系统调度。B 绕过 writer 后端仍保留调用方日志构造与 `Shadow.emit`，因此 A/B 的差异是 writer 后端在这条 `sweep()` 路径中的诊断，不是服务开关 off/on 结果。32/128 是合成规模，不表示在线已经观测到这些候选数。实际服务影响仍需同配置 shadow off/on 运行比较。
+
 ## 本地检查与未验证项
 
 本地现有 Python3.12，仅使用标准库及已有 NumPy；不安装包、不读取训练/测试数据、不加载真实 B 模型。轻量测试执行实际 Completion、Processor、Request、Scheduler 方法（AST加载，资源 stub），比较运行基线与 shadow开/关调度输出、KV调用、事件/状态和队列，覆盖静态次数/空白、字段门禁、伪造值、失败回退、首次/恢复/取消、共享数值快照和有界扫描。已有采集器及 mixed 回归继续执行。采集器原“整个IPC文件不变”断言仅调整为保护原有字段，显式允许新增尾部可选字段。
