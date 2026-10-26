@@ -287,7 +287,11 @@ printf '回传：%s\n' "$R1_DELIVERY"
 
 A 使用真实 `RecordWriter` 的有界队列、后台线程和 JSONL 写出，并检查正常关闭、footer、dropped/error 计数。B 使用诊断内存 sink；它仍执行 `Shadow.emit`、调用方字典构造、字段校验和 `Shadow` 的计时统计，只捕获有界的候选预测投影并直接返回成功，没有队列、后台线程或文件写出。B 不是“完全无日志模式”，也不能声称有完整逐请求日志或线上记录完整。
 
-每个候选规模默认模拟 `every=8` 的调用频率，A/B 使用同一输入与频率。两边先交替预热，再以默认每块 5 个成功预测的方式交替正式测量，块的先后顺序轮换 A/B 和 B/A。冷启动 Predictor 加载时间、A/B writer/sink 初始化时间、预热 sweep 分布和正式 sweep 分布分开记录。每一个 `Shadow.sweep()` 调用（包含 interval skip）都在内存中限量保留；每种规模最多 150 个正式成功预测事件、最多 100 个预热事件，且对 128 候选另设 20,000 条的单条件预测捕获上限。所有逐样本结果在测量结束后写入新建输出目录。
+每个独立测量块只创建当前条件的资源。块内记录后端启动、预热、正式样本、关闭时间；预热结束后用同一 Predictor 和当前 writer 创建新的诊断 Shadow，清空内部直方图再测正式样本。块关闭并完成校验后才开始下一块，因此 A writer 不会在 B 测量期间运行。块顺序交替 AB/BA；A 的 close、线程退出或 footer 检查失败时立即停止该配对，不生成有效 A/B 对照。关闭成本不计入 sweep 样本。
+
+本次命令显式使用 `every=1`，使每次 sweep 都执行预测，便于核对同一批调用的外部时间和内部直方图。每一个 `Shadow.sweep()` 调用都在内存中限量保留；每种规模最多 150 个正式成功预测事件、最多 100 个预热事件，且对 128 候选另设单条件预测捕获上限。正式 `dynamic_foreground` 分布来自重建后的 Shadow，仅统计正式块；外部 `sweep_summary` 也只统计同一块的正式调用。工具逐块核对外部调用数、内部直方图数、成功数和预测频率，多块汇总后再次核对计数。所有逐样本计时结果在测量结束后写入新建输出目录。
+
+默认 30 个正式成功样本适合冒烟检查。nearest-rank 的 P99 使用 `ceil(0.99*n)`，n=30 时 rank=30，P99 就是最大值。正式诊断建议每个条件、每个候选规模至少使用 150 个成功样本；即便如此，这仍是小规模 CPU 诊断，不能作为稳定的在线 P99 结论。
 
 正式 `sweep()` 墙钟时间由调用方用 `perf_counter_ns` 包围函数入口到返回，包含该次调用的候选处理、预测、`Shadow.emit`、调用方记录字典构造及函数内计时统计。JSON 同时保留实现自身 `dynamic_foreground` 分布；它是嵌套区间，且末尾不包含自己的最后一次直方图更新。分位数用 nearest-rank：rank=`ceil(p*n)`，从小到大的一基索引；报告 P50/P95/P99/max，候选规模按实际预测 `candidate_count` 分组，interval skip 使用 `candidate_count=null` 单独报告。A 关闭耗时和后台线程 footer 指标单独保留，不能与前台时间简单相加。
 
@@ -307,13 +311,13 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_TH
 "$R1_SERVICEPY" -B tools/r1_shadow/diagnose_cpu_overhead.py \
   --model "$R1_BMODEL" --shadow-jsonl "$R1_CORE_JSONL" \
   --out "$R1_CPU_DIAG/result" --run-id cpu_diag_001 \
-  --every 8 --warmup-sweeps 3 --sweeps 30 --block-size 5 \
+  --every 1 --warmup-sweeps 3 --sweeps 30 --block-size 5 \
   > "$R1_CPU_DIAG/console.log" 2>&1
 printf 'diagnostic_dir=%s\n' "$R1_CPU_DIAG"
 cat "$R1_CPU_DIAG/result/diagnostic.json"
 ```
 
-输出目录包含 `diagnostic.json`、每种规模的 A 组真实 JSONL 及 footer。报告保存脚本/模型和输入 shadow 文件标识、输入行号与 SHA、运行环境、线程池、冷启动、预热/正式样本、A/B 预测逐项一致性、各规模分布和 writer 完整性。它不把候选 ID/数值伪装成原始 prompt，也不复制原始日志到仓库。
+输出目录包含 `diagnostic.json` 和每个 A 块独立的真实 JSONL/footer。报告保存脚本/模型和输入 shadow 文件标识、输入行号与 SHA、运行环境、线程池、每块冷启动/预热/关闭成本、正式样本、A/B 预测逐项一致性、多块合并分布及每个 A footer/线程退出结果。正式推荐可将命令的 `--sweeps 30` 改为 `--sweeps 150`；输出目录必须保持全新。它不把候选 ID/数值伪装成原始 prompt，也不复制原始日志到仓库。
 
 该诊断只回答“在此 CPU、此 Predictor、此候选与状态输入下，真实异步 writer 后端和内存 sink 的局部差异”。CPU结果不能直接解释客户端 E2E 增量，也不能证明在线尖峰来自锁、磁盘、GIL或操作系统调度。B 绕过 writer 后端仍保留调用方日志构造与 `Shadow.emit`，因此 A/B 的差异是 writer 后端在这条 `sweep()` 路径中的诊断，不是服务开关 off/on 结果。32/128 是合成规模，不表示在线已经观测到这些候选数。实际服务影响仍需同配置 shadow off/on 运行比较。
 

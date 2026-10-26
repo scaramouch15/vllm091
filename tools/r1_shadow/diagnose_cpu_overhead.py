@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_SHA256 = "23aff057712e7bec05db91d470af39a1b34eabddbf5852914710e1b8e4b96e1f"
@@ -174,6 +174,7 @@ class MemorySink:
             if len(self.predictions) >= self.capture_limit:
                 raise RuntimeError("memory sink prediction capture limit exceeded")
             self.predictions.append({
+                "decision_batch_id": values["snapshot"]["decision_batch_id"],
                 "candidate_count": values["candidate_count"],
                 "candidates": values["candidates"],
             })
@@ -212,7 +213,8 @@ class Condition:
     writer_started_ns: int
 
 
-def new_condition(name: str, size: int, args, modules, predictor, group_dir: Path) -> Condition:
+def new_condition(name: str, size: int, block_dir: Path, block_sweeps: int,
+                  args, modules, predictor) -> Condition:
     shadow_module, collector_module = modules
     config = shadow_module.ShadowConfig(
         model=args.model.resolve(), run_id=args.run_id, directory=args.out.resolve(),
@@ -221,7 +223,7 @@ def new_condition(name: str, size: int, args, modules, predictor, group_dir: Pat
     started = time.perf_counter_ns()
     if name == "A":
         writer = collector_module.RecordWriter(
-            collector_module.CollectionConfig(args.run_id, group_dir / "writer_a"),
+            collector_module.CollectionConfig(args.run_id, block_dir / "writer_a"),
             "cpu-diagnostic-a", {"condition": "A_real_record_writer",
                                   "model_sha256": MODEL_SHA256,
                                   "candidate_size": size},
@@ -229,9 +231,15 @@ def new_condition(name: str, size: int, args, modules, predictor, group_dir: Pat
         sink = None
     else:
         writer = MemorySink(f"memory-{size}",
-                            capture_limit=(args.warmup_sweeps + args.sweeps) * size)
+                            capture_limit=(args.warmup_sweeps + block_sweeps) * size)
         sink = writer
-    shadow = shadow_module.Shadow(config, predictor, writer)
+    try:
+        shadow = shadow_module.Shadow(config, predictor, writer)
+    except BaseException:
+        writer.close()
+        if name == "A" and writer._thread.is_alive():
+            raise RuntimeError("A writer failed during setup and did not stop")
+        raise
     return Condition(shadow, writer, sink, time.perf_counter_ns() - started)
 
 
@@ -262,7 +270,9 @@ def invoke_sweep(condition: Condition, batch: list[dict], running: list,
 def compare_predictions(a_rows: list[dict], b_rows: list[dict]) -> dict:
     def project(rows):
         return [
-            [(candidate["engine_request_id"], candidate["prompt_tokens"],
+            [(row.get("snapshot", {}).get("decision_batch_id",
+                                         row.get("decision_batch_id")),
+              candidate["engine_request_id"], candidate["prompt_tokens"],
               candidate["max_tokens"], list(candidate["length_quantiles"]),
               list(candidate["time_quantiles"])) for candidate in row["candidates"]]
             for row in rows
@@ -274,6 +284,320 @@ def compare_predictions(a_rows: list[dict], b_rows: list[dict]) -> dict:
     return {"successful_sweeps": len(left),
             "candidate_predictions": sum(len(row) for row in left),
             "exact_numeric_and_identity_match": True}
+
+
+def prediction_phase(record: dict, condition: str) -> str | None:
+    if condition == "A":
+        decision_id = record.get("snapshot", {}).get("decision_batch_id")
+    else:
+        decision_id = record.get("decision_batch_id")
+    if not isinstance(decision_id, str):
+        return None
+    if "-warmup-" in decision_id:
+        return "warmup"
+    if "-measured-" in decision_id:
+        return "measured"
+    return None
+
+
+def validate_writer(condition: Condition, close_ok: bool) -> dict:
+    writer = condition.writer
+    thread_alive = writer._thread.is_alive()
+    result = {"close_ok": bool(close_ok), "writer_thread_alive_after_close": thread_alive,
+              "writer_thread_exited": not thread_alive, "footer_present": False,
+              "footer_complete": False, "writer_file": writer.path.name}
+    if thread_alive:
+        result["error"] = "writer thread remains alive after close"
+        result["passed"] = False
+        return result
+    records = read_jsonl(writer.path)
+    headers = [row for row in records if row.get("record_type") == "header"]
+    footers = [row for row in records if row.get("record_type") == "footer"]
+    footer = footers[-1] if footers else None
+    result["footer_present"] = footer is not None
+    result["footer"] = footer
+    data = [row for row in records
+            if row.get("record_type") not in ("header", "footer")]
+    metrics = footer.get("metrics", {}) if footer else {}
+    sequences = [row.get("sequence") for row in data]
+    sequence_ok = (
+        all(type(value) is int for value in sequences)
+        and sequences == list(range(1, len(sequences) + 1))
+        and type(footer.get("last_sequence")) is int
+        and footer.get("last_sequence") == len(sequences)
+    ) if footer else False
+    footer_complete = bool(
+        close_ok and len(headers) == 1 and records[0] is headers[0]
+        and len(footers) == 1 and records[-1] is footer
+        and headers[0].get("run_id") == writer.config.run_id
+        and footer.get("run_id") == writer.config.run_id
+        and footer.get("clean_shutdown") is True
+        and footer.get("records_complete") is True
+        and metrics.get("written_records") == len(data)
+        and metrics.get("dropped_records", 0) == 0
+        and metrics.get("serialization_errors", 0) == 0
+        and metrics.get("writer_errors", 0) == 0
+        and metrics.get("close_timeouts", 0) == 0
+        and metrics.get("unconfirmed_records", 0) == 0
+        and sequence_ok
+    )
+    result.update(footer_complete=footer_complete, passed=footer_complete,
+                  record_count=len(data), sequence_check=sequence_ok)
+    if not footer_complete:
+        result["error"] = "writer close/footer/drain validation failed"
+    return result
+
+
+def dynamic_histogram_count(distribution: dict) -> int:
+    return sum(group["n"] for group in distribution["groups"]
+               if group["stage"] == "dynamic_foreground")
+
+
+def merge_dynamic_distributions(shadow_module, shadows: list[Any]) -> dict:
+    overall = shadow_module.DurationHistogram()
+    groups = {}
+    for shadow in shadows:
+        for (stage, outcome, candidate_count), histogram in shadow.duration_histograms.items():
+            if stage != "dynamic_foreground":
+                continue
+            overall.merge(histogram)
+            key = (outcome, candidate_count)
+            if key not in groups:
+                groups[key] = shadow_module.DurationHistogram()
+            groups[key].merge(histogram)
+    return {
+        "schema_version": 1,
+        "unit": "ns",
+        "method": "nearest_rank_log_bucket_bounds_4_significant_bits",
+        "bins_per_group": shadow_module.DurationHistogram.NUM_BINS,
+        "overall": {"dynamic_foreground": overall.report()} if overall.n else {},
+        "groups": [dict(stage="dynamic_foreground", outcome=outcome,
+                        candidate_count=candidate_count, **histogram.report())
+                   for (outcome, candidate_count), histogram in groups.items()],
+    }
+
+
+def make_shadow(shadow_module, condition: Condition, args, size: int,
+                predictor, directory: Path):
+    config = shadow_module.ShadowConfig(
+        model=args.model.resolve(), run_id=args.run_id, directory=directory.resolve(),
+        candidates=size, scan_limit=size, every=args.every,
+    )
+    return shadow_module.Shadow(config, predictor, condition.writer)
+
+
+def run_condition_block(name: str, size: int, block_index: int,
+                        successful_start: int, successful_count: int,
+                        args, modules, predictor, batch: list[dict],
+                        source_snapshot: dict, block_dir: Path) -> dict:
+    """Run one isolated condition block through shutdown and backend verification."""
+    shadow_module, _ = modules
+    result = {"condition": name, "candidate_size": size,
+              "block_index": block_index, "successful_start": successful_start,
+              "successful_count": successful_count, "block_passed": False,
+              "sweep_samples": [], "warmup_sweep_samples": [],
+              "predictions": {"warmup": [], "measured": []}}
+    condition = None
+    active_shadow = None
+    closed = False
+    try:
+        block_dir.mkdir(parents=True, exist_ok=False)
+        condition = new_condition(name, size, block_dir, successful_count,
+                                  args, modules, predictor)
+        result["backend_startup_ns"] = condition.writer_started_ns
+        active_shadow = condition.shadow
+        running = [object() for _ in range(source_snapshot["running_count"])]
+
+        def opportunity(shadow, phase: str, index: int) -> list[dict]:
+            condition.shadow = shadow
+            observations = []
+            for inner in range(args.every):
+                decision = f"diag-{block_index}-{size}-{phase}-{index}-{inner}"
+                observations.append(invoke_sweep(condition, batch, running,
+                                                 source_snapshot, decision, phase))
+            return observations
+
+        # Startup and warmup are outside formal sweep samples.
+        warmup_shadow = active_shadow
+        warmup_started = time.perf_counter_ns()
+        for warm_index in range(args.warmup_sweeps):
+            result["warmup_sweep_samples"].extend(
+                opportunity(warmup_shadow, "warmup", warm_index))
+        result["warmup_elapsed_ns"] = time.perf_counter_ns() - warmup_started
+        result["warmup_dynamic_foreground"] = warmup_shadow.duration_report()
+        result["warmup_counts"] = dict(warmup_shadow.counts)
+        result["_warmup_shadow"] = warmup_shadow
+        warmup_observations = dynamic_histogram_count(
+            result["warmup_dynamic_foreground"])
+        expected_warmup_calls = args.warmup_sweeps * args.every
+        result["warmup_histogram_matches_external"] = (
+            warmup_observations == len(result["warmup_sweep_samples"])
+            == expected_warmup_calls
+        )
+        result["warmup_outcomes_complete"] = (
+            warmup_shadow.counts["dynamic_outcome_success"] == args.warmup_sweeps
+            and warmup_shadow.counts["dynamic_outcome_interval_skip"]
+            == args.warmup_sweeps * (args.every - 1)
+            and warmup_shadow.counts["dynamic_outcome_failed"] == 0
+            and warmup_shadow.counts["dynamic_outcome_empty"] == 0
+        )
+        result["_warmup_shadow"] = warmup_shadow
+
+        # A fresh Shadow resets its internal histogram while retaining the same
+        # predictor and backend writer. No online runtime code is changed.
+        active_shadow = make_shadow(shadow_module, condition, args, size,
+                                    predictor, args.out)
+        condition.shadow = active_shadow
+        result["sweep_samples"] = []
+        for sample_index in range(successful_start,
+                                  successful_start + successful_count):
+            result["sweep_samples"].extend(
+                opportunity(active_shadow, "measured", sample_index))
+        result["dynamic_foreground"] = active_shadow.duration_report()
+        result["shadow_counts"] = dict(active_shadow.counts)
+        result["_formal_shadow"] = active_shadow
+        formal_observations = dynamic_histogram_count(result["dynamic_foreground"])
+        expected_formal_calls = successful_count * args.every
+        formal_successes = active_shadow.counts["dynamic_outcome_success"]
+        expected_skips = successful_count * (args.every - 1)
+        result["formal_histogram_matches_external"] = (
+            formal_observations == len(result["sweep_samples"])
+            == expected_formal_calls
+        )
+        result["formal_outcomes_complete"] = (
+            formal_successes == successful_count
+            and active_shadow.counts["dynamic_outcome_interval_skip"] == expected_skips
+            and active_shadow.counts["dynamic_outcome_failed"] == 0
+            and active_shadow.counts["dynamic_outcome_empty"] == 0
+        )
+
+        close_started = time.perf_counter_ns()
+        close_ok = active_shadow.close()
+        result["close_elapsed_ns"] = time.perf_counter_ns() - close_started
+        closed = True
+        if name == "A":
+            result["backend_status"] = validate_writer(condition, close_ok)
+            if result["backend_status"]["writer_thread_exited"]:
+                records = read_jsonl(condition.writer.path)
+                result["predictions"] = {
+                    phase: [row for row in records
+                            if row.get("record_type") == "shadow_candidates"
+                            and prediction_phase(row, "A") == phase]
+                    for phase in ("warmup", "measured")
+                }
+        else:
+            result["backend_status"] = {
+                "backend": "diagnostic_memory_sink",
+                "close_ok": bool(close_ok),
+                "sink_closed": condition.sink.closed,
+                "queue_thread_or_disk": False,
+                "captures_prediction_projection_in_bounded_memory": True,
+                "online_log_completeness_claim": False,
+                "passed": bool(close_ok and condition.sink.closed),
+            }
+            result["predictions"] = {
+                phase: [row for row in condition.sink.predictions
+                        if prediction_phase(row, "B") == phase]
+                for phase in ("warmup", "measured")
+            }
+
+        expected_prediction_events = {
+            "warmup": args.warmup_sweeps,
+            "measured": successful_count,
+        }
+        result["prediction_capture_complete"] = all(
+            len(result["predictions"][phase]) == expected
+            for phase, expected in expected_prediction_events.items()
+        )
+        result["block_passed"] = all((
+            result["backend_status"]["passed"],
+            result["warmup_histogram_matches_external"],
+            result["warmup_outcomes_complete"],
+            result["formal_histogram_matches_external"],
+            result["formal_outcomes_complete"],
+            result["prediction_capture_complete"],
+        ))
+        if not result["block_passed"]:
+            result["error"] = "condition block validation failed"
+    except BaseException as exc:
+        result["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        result["block_passed"] = False
+    finally:
+        if condition is not None and active_shadow is not None and not closed:
+            try:
+                close_started = time.perf_counter_ns()
+                close_ok = active_shadow.close()
+                result.setdefault("cleanup_close_elapsed_ns",
+                                  time.perf_counter_ns() - close_started)
+                closed = True
+                if name == "A":
+                    result["cleanup_backend_status"] = validate_writer(condition, close_ok)
+                else:
+                    result["cleanup_backend_status"] = {
+                        "close_ok": bool(close_ok),
+                        "sink_closed": condition.sink.closed,
+                        "passed": bool(close_ok and condition.sink.closed),
+                    }
+            except BaseException as cleanup_exc:
+                result["cleanup_error"] = {
+                    "type": type(cleanup_exc).__name__, "message": str(cleanup_exc)}
+    return result
+
+
+def run_paired_block(order: tuple[str, str], runner: Callable[[str], dict]) -> dict:
+    """Run sequentially; stop before the next condition if a block is invalid."""
+    results = {}
+    for name in order:
+        block = runner(name)
+        results[name] = block
+        if not block.get("block_passed"):
+            return {"pair_passed": False, "results": results,
+                    "failed_condition": name, "comparison": None}
+    try:
+        comparisons = {
+            phase: compare_predictions(results["A"]["predictions"][phase],
+                                       results["B"]["predictions"][phase])
+            for phase in ("warmup", "measured")
+        }
+    except BaseException as exc:
+        return {"pair_passed": False, "results": results,
+                "failed_condition": "prediction_comparison",
+                "comparison_error": {"type": type(exc).__name__, "message": str(exc)},
+                "comparison": None}
+    return {"pair_passed": True, "results": results,
+            "failed_condition": None, "comparison": comparisons}
+
+
+def summarize_condition_blocks(shadow_module, blocks: list[dict]) -> dict:
+    formal_samples = [sample for block in blocks for sample in block["sweep_samples"]]
+    warmup_samples = [sample for block in blocks
+                      for sample in block["warmup_sweep_samples"]]
+    formal_shadows = [block["_formal_shadow"] for block in blocks]
+    warmup_shadows = [block["_warmup_shadow"] for block in blocks]
+    formal_distribution = merge_dynamic_distributions(shadow_module, formal_shadows)
+    warmup_distribution = merge_dynamic_distributions(shadow_module, warmup_shadows)
+    formal_count = dynamic_histogram_count(formal_distribution)
+    warmup_count = dynamic_histogram_count(warmup_distribution)
+    require(formal_count == len(formal_samples),
+            "merged formal dynamic histogram and external sample count differ")
+    require(warmup_count == len(warmup_samples),
+            "merged warmup dynamic histogram and external sample count differ")
+    return {
+        "formal_sweep_summary": summarize(formal_samples),
+        "warmup_sweep_summary": summarize(warmup_samples),
+        "dynamic_foreground": formal_distribution,
+        "warmup_dynamic_foreground": warmup_distribution,
+        "formal_external_sample_count": len(formal_samples),
+        "formal_internal_histogram_count": formal_count,
+        "warmup_external_sample_count": len(warmup_samples),
+        "warmup_internal_histogram_count": warmup_count,
+        "footer_checks_passed": all(
+            block["backend_status"].get("passed", False)
+            for block in blocks if block["condition"] == "A"
+        ),
+        "successful_prediction_sweeps": sum(
+            len(block["predictions"]["measured"]) for block in blocks),
+    }
 
 
 def main() -> None:
@@ -304,20 +628,20 @@ def main() -> None:
     require(not args.out.resolve().is_relative_to(ROOT),
             "output must be outside the repository")
     args.out.mkdir(parents=True, exist_ok=False)
-    report = {"schema_version": 1, "passed": False,
+    report = {"schema_version": 2, "passed": False,
               "scope": "CPU-only offline Shadow.sweep/writer-backend diagnostic",
               "model_expected_sha256": MODEL_SHA256,
               "candidate_sizes": list(CANDIDATE_SIZES), "every": args.every,
-              "warmup_successful_sweeps": args.warmup_sweeps,
+              "warmup_successful_sweeps_per_block": args.warmup_sweeps,
               "measured_successful_sweeps_per_condition_size": args.sweeps,
               "block_size": args.block_size,
               "python": platform.python_version(), "interpreter": sys.executable,
               "host": platform.node(), "cpu_model": platform.processor(),
               "cpu_affinity": sorted(os.sched_getaffinity(0))
               if hasattr(os, "sched_getaffinity") else None,
-              "samples": [], "sizes": []}
+              "samples": [], "sizes": [], "blocks": [], "pairs": [],
+              "size_summaries": {}, "prediction_checks": {}}
     error = None
-    active_conditions: list[Condition] = []
     try:
         require(platform.python_version() == "3.10.22", "requires verified Python 3.10.22 service interpreter")
         for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
@@ -348,6 +672,7 @@ def main() -> None:
         report["threadpools"] = predictor.threadpools
         source_candidates = source_record["candidates"][:8]
         source_snapshot = source_record["snapshot"]
+        pair_index = 0
         for size in CANDIDATE_SIZES:
             batch, provenance = make_batch(source_candidates, size)
             report["sizes"].append({"candidate_count": size,
@@ -355,140 +680,106 @@ def main() -> None:
                                     "provenance": provenance})
             group_dir = args.out / f"candidate_{size}"
             group_dir.mkdir()
-            conditions = {}
-            for name in ("A", "B"):
-                condition = new_condition(name, size, args, modules, predictor,
-                                          group_dir)
-                conditions[name] = condition
-                active_conditions.append(condition)
-            report.setdefault("backend_startup_ns", {})[str(size)] = {
-                name: condition.writer_started_ns for name, condition in conditions.items()
-            }
-            running = [object() for _ in range(source_snapshot["running_count"])]
-            local_samples = {"A": [], "B": []}
-            warmup_samples = {"A": [], "B": []}
-            def one_opportunity(name: str, phase: str, successful_index: int):
-                condition = conditions[name]
-                # One logical candidate opportunity contains `every` real calls;
-                # Shadow.sweep itself decides which call predicts and which skips.
-                observed = []
-                for inner in range(args.every):
-                    decision = f"diag-{size}-{phase}-{successful_index}-{inner}"
-                    observed.append(invoke_sweep(condition, batch, running,
-                                                 source_snapshot, decision, phase))
-                destination = warmup_samples if phase == "warmup" else local_samples
-                destination[name].extend(observed)
-
-            # Warmup is also paired and order-alternated, but never enters timing samples.
-            for warm_index in range(args.warmup_sweeps):
-                order = paired_order(warm_index)
-                for name in order:
-                    one_opportunity(name, "warmup", warm_index)
-
-            # Formal measurements alternate A/B order in bounded successful-sweep blocks.
+            condition_blocks = {"A": [], "B": []}
             for block_start in range(0, args.sweeps, args.block_size):
-                block_index = block_start // args.block_size
-                order = paired_order(block_index)
-                end = min(args.sweeps, block_start + args.block_size)
-                for name in order:
-                    for successful_index in range(block_start, end):
-                        one_opportunity(name, "measured", successful_index)
+                block_count = min(args.block_size, args.sweeps - block_start)
+                current_pair_index = pair_index
+                order = paired_order(current_pair_index)
 
-            condition_results = {}
-            for name, condition in conditions.items():
-                close_started = time.perf_counter_ns()
-                closed_ok = condition.shadow.close()
-                close_elapsed = time.perf_counter_ns() - close_started
-                if name == "A":
-                    records = read_jsonl(condition.writer.path)
-                    footer = next((r for r in reversed(records)
-                                   if r.get("record_type") == "footer"), None)
-                    emitted = [r for r in records
-                               if r.get("record_type") == "shadow_candidates"]
-                    writer_ok = bool(closed_ok and footer
-                                     and footer.get("clean_shutdown")
-                                     and footer.get("records_complete")
-                                     and footer.get("metrics", {}).get("dropped_records", 0) == 0
-                                     and footer.get("metrics", {}).get("writer_errors", 0) == 0
-                                     and footer.get("metrics", {}).get("serialization_errors", 0) == 0)
-                    detail = {"writer_file": str(condition.writer.path.relative_to(args.out)),
-                              "close_ok": closed_ok, "footer_present": footer is not None,
-                              "footer": footer, "writer_complete": writer_ok}
-                else:
-                    emitted = condition.sink.predictions
-                    writer_ok = condition.sink.closed and closed_ok
-                    detail = {"backend": "diagnostic_memory_sink",
-                              "emit_returns_success": True,
-                              "queue_thread_or_disk": False,
-                              "captures_prediction_projection_in_bounded_memory": True,
-                              "captured_sweeps": len(emitted),
-                              "online_log_completeness_claim": False,
-                              "close_ok": closed_ok}
-                if not writer_ok:
-                    report.setdefault("errors", []).append(f"condition {name}, size {size}: writer incomplete")
-                expected_prediction_sweeps = args.warmup_sweeps + args.sweeps
-                observed_prediction_sweeps = condition.shadow.counts["dynamic_outcome_success"]
-                detail["expected_prediction_sweeps"] = expected_prediction_sweeps
-                detail["observed_prediction_sweeps"] = observed_prediction_sweeps
-                detail["sweep_outcomes_complete"] = (
-                    observed_prediction_sweeps == expected_prediction_sweeps
-                    and condition.shadow.counts["dynamic_outcome_failed"] == 0
-                    and condition.shadow.counts["dynamic_outcome_empty"] == 0
-                )
-                if not detail["sweep_outcomes_complete"]:
-                    report.setdefault("errors", []).append(
-                        f"condition {name}, size {size}: prediction sweep outcomes incomplete")
-                condition_results[name] = {
-                    "writer_status": detail,
-                    "sweep_samples": local_samples[name],
-                    "sweep_summary": summarize(local_samples[name]),
-                    "warmup_sweep_samples": warmup_samples[name],
-                    "warmup_sweep_summary": summarize(warmup_samples[name]),
-                    "dynamic_foreground": condition.shadow.duration_report(),
-                    "shadow_counts": dict(condition.shadow.counts),
-                    "close_elapsed_ns": close_elapsed,
-                    "predictions": emitted,
+                def run_one(name: str) -> dict:
+                    block_dir = (group_dir /
+                                 f"pair_{current_pair_index:03d}_{name}")
+                    return run_condition_block(
+                        name, size, current_pair_index, block_start, block_count,
+                        args, modules, predictor, batch, source_snapshot, block_dir,
+                    )
+
+                pair = run_paired_block(order, run_one)
+                pair_report = {
+                    "candidate_size": size,
+                    "pair_index": current_pair_index,
+                    "order": list(order),
+                    "pair_passed": pair["pair_passed"],
+                    "failed_condition": pair.get("failed_condition"),
+                    "comparison": pair.get("comparison"),
+                    "comparison_error": pair.get("comparison_error"),
                 }
-            prediction_check = compare_predictions(
-                condition_results["A"]["predictions"],
-                condition_results["B"]["predictions"],
-            )
-            for name in ("A", "B"):
-                report["samples"].extend(
-                    {"candidate_size": size, "condition": name, **sample}
-                    for sample in condition_results[name]["warmup_sweep_samples"]
-                )
-                report["samples"].extend(
-                    {"candidate_size": size, "condition": name, **sample}
-                    for sample in condition_results[name]["sweep_samples"]
-                )
-            report.setdefault("condition_summaries", {})[str(size)] = {
-                name: {"writer_status": value["writer_status"],
-                       "sweep_summary": value["sweep_summary"],
-                       "warmup_sweep_summary": value["warmup_sweep_summary"],
-                       "dynamic_foreground": value["dynamic_foreground"],
-                       "shadow_counts": value["shadow_counts"],
-                       "close_elapsed_ns": value["close_elapsed_ns"]}
-                for name, value in condition_results.items()
+                report["pairs"].append(pair_report)
+                for name, block in pair["results"].items():
+                    condition_blocks[name].append(block)
+                    public_block = {
+                        key: value for key, value in block.items()
+                        if not key.startswith("_")
+                        and key not in ("predictions", "sweep_samples",
+                                        "warmup_sweep_samples")
+                    }
+                    public_block["block_dir"] = str(
+                        (group_dir / f"pair_{current_pair_index:03d}_{name}")
+                        .relative_to(args.out))
+                    report["blocks"].append(public_block)
+                    report["samples"].extend(
+                        {"candidate_size": size, "condition": name, **sample}
+                        for sample in block.get("warmup_sweep_samples", []))
+                    report["samples"].extend(
+                        {"candidate_size": size, "condition": name, **sample}
+                        for sample in block.get("sweep_samples", []))
+                if not pair["pair_passed"]:
+                    report.setdefault("errors", []).append(
+                        f"candidate size {size}, pair {current_pair_index}: "
+                        f"{pair.get('failed_condition')} failed; pair is invalid")
+                    raise RuntimeError("condition block or pair validation failed")
+                pair_index += 1
+
+            report["size_summaries"][str(size)] = {
+                name: summarize_condition_blocks(shadow_module, blocks)
+                for name, blocks in condition_blocks.items()
             }
-            report.setdefault("prediction_checks", {})[str(size)] = prediction_check
-            del condition_results
-        backend_checks_passed = all(
-            summary[name]["writer_status"].get("writer_complete",
-                      summary[name]["writer_status"].get("close_ok", False))
-            and summary[name]["writer_status"]["sweep_outcomes_complete"]
-            for summary in report["condition_summaries"].values()
-            for name in ("A", "B")
-        )
-        report["passed"] = backend_checks_passed and all(
-            value["exact_numeric_and_identity_match"]
-            for value in report["prediction_checks"].values()
+            require(all(summary["footer_checks_passed"]
+                        for summary in report["size_summaries"][str(size)].values()),
+                    f"candidate size {size}: at least one block summary invalid")
+            size_pairs = [pair for pair in report["pairs"]
+                          if pair["candidate_size"] == size]
+            report["prediction_checks"][str(size)] = {
+                "pairs": [pair["comparison"] for pair in size_pairs],
+                "measured_successful_sweeps_per_condition": sum(
+                    pair["comparison"]["measured"]["successful_sweeps"]
+                    for pair in size_pairs),
+                "candidate_predictions_per_condition": sum(
+                    pair["comparison"]["measured"]["candidate_predictions"]
+                    for pair in size_pairs),
+                "exact_numeric_and_identity_match": all(
+                    pair["pair_passed"] for pair in size_pairs),
+            }
+            report["prediction_checks"][str(size)]["requested_counts_match"] = (
+                report["prediction_checks"][str(size)][
+                    "measured_successful_sweeps_per_condition"] == args.sweeps
+                and report["prediction_checks"][str(size)][
+                    "candidate_predictions_per_condition"] == args.sweeps * size
+            )
+        report["passed"] = bool(
+            all(pair["pair_passed"] for pair in report["pairs"])
+            and all(value["exact_numeric_and_identity_match"]
+                    for value in report["prediction_checks"].values())
+            and all(value["requested_counts_match"]
+                    for value in report["prediction_checks"].values())
+            and all(
+                summary["footer_checks_passed"]
+                and summary["formal_internal_histogram_count"]
+                == summary["formal_external_sample_count"]
+                and summary["warmup_internal_histogram_count"]
+                == summary["warmup_external_sample_count"]
+                for by_condition in report["size_summaries"].values()
+                for summary in by_condition.values()
+            )
         )
         report["timing_scope"] = (
             "External perf_counter_ns around the complete Shadow.sweep() call through return, "
             "including Shadow.emit, caller record construction, validation and foreground timing bookkeeping. "
             "dynamic_foreground is the implementation's own nested interval and excludes its final histogram update. "
             "Neither measure is client E2E or online scheduler overhead."
+        )
+        report["block_execution"] = (
+            "Each A/B condition owns resources only within its block. The block is fully shut down and validated before the next condition starts; an invalid block stops the pair and no valid comparison is recorded. Pair order alternates AB/BA."
         )
         report["backend_scope"] = {
             "A": "real bounded RecordWriter queue, background thread and JSONL serialization/write/flush; close/footer checked",
@@ -505,12 +796,6 @@ def main() -> None:
         report["error"] = error
         raise
     finally:
-        for condition in active_conditions:
-            try:
-                condition.shadow.close()
-            except BaseException as close_exc:
-                report.setdefault("cleanup_errors", []).append(
-                    {"type": type(close_exc).__name__, "message": str(close_exc)})
         report["error"] = error
         report_path = args.out / "diagnostic.json"
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2,
