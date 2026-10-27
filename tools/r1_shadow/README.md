@@ -6,7 +6,7 @@
 
 默认 `VLLM_R1_SHADOW=0`：不导入 sklearn/joblib、不加载模型、不创建 shadow writer、计数器或首次记录集合，也不做快照聚合/预测。新增 ECR 可选字段缺省 None；因此需前端/Core 同版本，不能滚动混用旧 schema。关闭时保留原生队列、发送、计时和统计路径；新增字段属性及条件判断仍有极少量 Python 开销，不宣称二进制协议或墙钟耗时完全不变。
 
-开启：仅 CPU 预测，绝不排序 waiting/running 或候选列表。`np.sort` 只对一个请求的三个分位数做训练规定的后处理。本轮没有“预测+排序完整耗时”。候选预测只是观察，没有通过 KV 检查的含义。
+开启预测：仅 CPU 预测，不排序 waiting/running 或原候选列表。`np.sort` 只对一个请求的三个分位数做训练规定的后处理。可独立启用下述影子排序生成另一份 ID 列表；候选预测和排序只是观察，不代表通过 KV 检查。
 
 B 模型固定 SHA256：`23aff057712e7bec05db91d470af39a1b34eabddbf5852914710e1b8e4b96e1f`。仅从用户自己的可信本地 joblib 加载，先核对哈希，再反序列化。固定 Python 3.10.22、NumPy 2.2.6、SciPy 1.15.3、sklearn 1.7.2、joblib 1.5.3、threadpoolctl 3.6.0；不匹配启动失败，不能悄悄换模型。前端/每个 Core 初始化各加载一次完整原 artifact，随后只保留对应角色的 encoder+length head 或 time head。当前未拆分 artifact；启动反序列化和瞬时内存成本不能称为零。
 
@@ -49,6 +49,21 @@ token-ID、embeds、多 prompt、n>1、beam、截断（包括 -1）、特殊 tok
 | `VLLM_R1_SHADOW_CANDIDATES` | 32；每轮最多 K 个有效候选 |
 | `VLLM_R1_SHADOW_SCAN_LIMIT` | 128；最多检查队列前 S 个位置，K<=S<=4096 |
 | `VLLM_R1_SHADOW_EVERY` | 8；第 1、9、17…次符合原生 waiting 机会条件的轮次预测 |
+| `VLLM_R1_SHADOW_SORT` | 0；设为 1 才在成功预测后生成独立 P90 稳定升序 ID 列表，仅接受 0/1。预测关闭时不解析此开关，也不会自动开启预测；研究开关而非原生 vLLM 参数。 |
+
+### P90 影子排序
+
+预测成功且候选非空时，启用排序才复用本批已校验的 `time_quantiles[1]`，按 `p90_ascending_stable_v1` 升序稳定排序，相同 P90 保留原候选次序，不使用 ID 作为次键、不再次预测。原候选、预测列表、waiting/running 和 sweep 返回的原顺序 ID tuple 不变。跳过、空候选或预测失败不排序，不复用旧结果。真实队列未重排，P90 只是链路与开销对照，不是最终公式；顺序改变也不证明调度收益或实际可准入顺序。
+
+启动 header 的 `shadow_sort_enabled`、`shadow_sort_rule` 和 `shadow_sort_timing_version` 分别记录实际开关、规则和计时版本。成功时最多新增一条 `shadow_sort`：`decision_batch_id` 关联 `shadow_candidates.snapshot.decision_batch_id`；`candidate_count` 为本次实际候选数，`sorted_request_ids` 为独立列表，`order_changed` 比较原候选的相对位置。记录无 prompt 或可变 Request 对象。
+
+排序计时版本 1 使用 `perf_counter_ns`：`key_construct_ns` 为构造 P90 键列表，`stable_sort_ns` 为稳定排序索引，`id_construct_ns` 为从索引构造 ID 列表；`sort_total_ns` 从排序方法入口开始，包含计数、必要输入校验、上述子项、顺序比较及记录字典构造，至写入该字段前，且不包含 emit。整体包含子项，不能相加。原 `shadow_candidates` emit 完成后才执行排序，因此原 `state_read_ns`、`extract_assemble_ns`、`time_head_ns`、`shadow_compute_ns` 边界不变。`dynamic_foreground` 继续覆盖排序、排序日志入队和原返回值构造，排除自身后续直方图记账以及后台序列化、写盘和 flush。子项与外围区间不能相加。
+
+`sort_attempts = sort_success + sort_errors`；关闭、跳过、空候选或预测失败不尝试。排序异常只记录 `shadow_sort_error` 的批次 ID 和错误类型，预测成功及原返回值保留，FCFS 继续执行。日志入队失败由既有 `log_dropped`/`log_errors` 和 writer 完整性机制报告，不计作排序计算失败；检查 summary 与 footer。直方图分位数仍是桶边界区间，而非精确样本分位数。
+
+8/128/32 是此前受控配置，不是最终参数，也不随 `max-num-seqs`、`request-rate` 或 `max-concurrency` 自动调整。EVERY 按符合条件的 sweep 机会计数，不是所有调度轮次或固定时间；区分 waiting 实际规模、实际扫描数量与扫描上限、实际候选数量与候选上限。此前常见候选数约 24，不能推广到更大队列或更高预测频率。真实重排前须设计预测更新时机、候选数量与扫描范围、窗口外请求的机会、跳过预测时的选择，以及旧预测能否复用和失效规则；结合服务端实际状态、成本与公平性论证，不按客户端配置数值比例简单设置。当前未实现自适应、公平性或旧预测复用。
+
+后续在线对照可比较“预测开、排序关”与“预测开、排序开”，其他条件沿用已验证配置并分别保存结果。本次代码交付不运行服务、Benchmark 或服务器实验。
 
 在扫描窗口内保持原队列顺序，选前 K 个有效且未首次准入的 WAITING 请求；不为填满 K 扫描无界队列。WAITING_FOR_*、PREEMPTED、已首次准入、静态缺失均跳过并计数。空候选不组装特征、不预测。状态标量每个符合条件轮次读取一次；有采样间隔的轮次仍可记录实际准入状态。同一请求等待期间可多次动态预测，静态计算不重复。覆盖率分母是记录的 completion/Processor 请求、waiting 机会、被有界扫描看到的机会，不能声称覆盖全部队列。
 
@@ -90,7 +105,7 @@ log_enqueue 与外围完整阶段嵌套；footer.metrics.enqueue_ns 是 writer �
 
 不移动 scheduled_timestamp：它仍在schedule较早的位置生成；动态计算、首次准入记录等位于其后，可能进入原scheduled_ts→last_token_ts的inference_time区间。前端静态位于Processor默认arrival_time之前，可能不进入原引擎统计，但进入客户端E2E；Processor字段消费位于该arrival_time之后。结束日志位于Core释放路径，也可能影响同轮输出可见时机。EngineCoreOutputs批次时间、SCHEDULED/NEW_TOKEN和完成公式均不改。局部区间不能覆盖完整服务内增量，真实端到端影响只能通过**完全同配置的shadow off/on**比较客户端原生延迟和吞吐评估。
 
-线程限制在启动导入前设置/检查，不在预测函数中反复修改全进程线程池；四个变量也会影响服务内其他CPU库。off/on必须保持同线程和服务/客户端配置，不能把微基准单CPU taskset套到整个服务进程。旁路仍不排序、不主动改变准入规则，CPU争用可能改变墙钟交错和实际批次轨迹。
+线程限制在启动导入前设置/检查，不在预测函数中反复修改全进程线程池；四个变量也会影响服务内其他CPU库。off/on必须保持同线程和服务/客户端配置，不能把微基准单CPU taskset套到整个服务进程。影子排序不主动改变准入规则，CPU争用可能改变墙钟交错和实际批次轨迹。
 
 ## 与旧采集器的组合
 

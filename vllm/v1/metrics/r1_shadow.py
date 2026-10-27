@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in CPU shadow inference. No ordering, allocation or sampling decisions.
+"""Opt-in CPU shadow inference. No queue, allocation or sampling decisions.
 
 Numerical dependencies are imported only by Predictor at enabled startup.
 The immutable envelope is local to the frontend and removed before Core IPC.
@@ -24,10 +24,16 @@ from pathlib import Path
 MODEL_SHA256 = "23aff057712e7bec05db91d470af39a1b34eabddbf5852914710e1b8e4b96e1f"
 INTERNAL_KEY = "_vllm_r1_shadow_static_v1"
 QUANTILES = [0.5, 0.9, 0.95]
+SORT_RULE = "p90_ascending_stable_v1"
+SORT_TIMING_VERSION = 1
 LENGTH_FIELDS = ["num_prompt_tokens"] + [f"text_{i}" for i in range(32)]
 TIME_FIELDS = ["num_prompt_tokens", "running_count", "kv_usage",
                "pred_output_q50", "pred_output_q90", "pred_output_q95"]
 logger = logging.getLogger(__name__)
+
+
+def stable_sort_indices(keys):
+    return sorted(range(len(keys)), key=keys.__getitem__)
 
 
 def require(condition, message):
@@ -117,6 +123,7 @@ class ShadowConfig:
     candidates: int = 32
     scan_limit: int = 128
     every: int = 8
+    sort: bool = False
 
     @classmethod
     def from_env(cls):
@@ -133,10 +140,13 @@ class ShadowConfig:
         cap = int(os.environ.get("VLLM_R1_SHADOW_CANDIDATES", "32"))
         scan = int(os.environ.get("VLLM_R1_SHADOW_SCAN_LIMIT", "128"))
         every = int(os.environ.get("VLLM_R1_SHADOW_EVERY", "8"))
+        sort = os.environ.get("VLLM_R1_SHADOW_SORT", "0")
+        require(sort in ("0", "1"), "VLLM_R1_SHADOW_SORT must be 0 or 1")
         require(1 <= cap <= scan <= 4096 and every > 0,
                 "require 1 <= candidates <= scan_limit <= 4096, every > 0")
         return cls(Path(model).expanduser().resolve(), run,
-                   Path(directory).expanduser().resolve(), cap, scan, every)
+                   Path(directory).expanduser().resolve(), cap, scan, every,
+                   sort == "1")
 
 
 @dataclass(frozen=True)
@@ -304,6 +314,8 @@ class Shadow:
             self.counts["dynamic_outcome_" + outcome] = 0
         for outcome in ("success", "failed", "skipped"):
             self.counts["static_outcome_" + outcome] = 0
+        for name in ("sort_attempts", "sort_success", "sort_errors"):
+            self.counts[name] = 0
         self.duration_histograms = {}
         self.batch = 0
         self.closed = False
@@ -490,6 +502,8 @@ class Shadow:
                 "state_read_ns": state_read - start,
                 "time_head_ns": predicted - assembled,
                 "shadow_compute_ns": time.perf_counter_ns() - start})
+            if self.config.sort:
+                self.sort_candidates(snapshot, candidates, predictions)
             return snapshot, tuple(r.request_id for r in candidates)
         except Exception as exc:
             outcome = "failed"
@@ -504,6 +518,38 @@ class Shadow:
             count = None if outcome == "interval_skip" else len(candidates)
             self.observe_elapsed("dynamic_foreground", start, outcome, count,
                                  total_counter="shadow_total_ns")
+
+    def sort_candidates(self, snapshot, candidates, predictions):
+        """Record a separate ordering; failures do not change prediction success."""
+        start = time.perf_counter_ns()
+        self.counts["sort_attempts"] += 1
+        try:
+            require(len(candidates) == len(predictions) and len(candidates) > 0,
+                    "invalid sorting inputs")
+            key_start = time.perf_counter_ns()
+            keys = [values[1] for values in predictions]
+            key_end = time.perf_counter_ns()
+            indices = stable_sort_indices(keys)
+            sort_end = time.perf_counter_ns()
+            ids = [candidates[index].request_id for index in indices]
+            ids_end = time.perf_counter_ns()
+            record = {"decision_batch_id": snapshot["decision_batch_id"],
+                      "rule": SORT_RULE, "timing_version": SORT_TIMING_VERSION,
+                      "candidate_count": len(candidates),
+                      "sorted_request_ids": ids,
+                      "order_changed": indices != list(range(len(candidates))),
+                      "key_construct_ns": key_end - key_start,
+                      "stable_sort_ns": sort_end - key_end,
+                      "id_construct_ns": ids_end - sort_end}
+            record["sort_total_ns"] = time.perf_counter_ns() - start
+        except Exception as exc:
+            self.counts["sort_errors"] += 1
+            self.emit("shadow_sort_error", {
+                "decision_batch_id": snapshot["decision_batch_id"],
+                "error_type": type(exc).__name__})
+            return
+        self.counts["sort_success"] += 1
+        self.emit("shadow_sort", record)
 
     def admit(self, request, decision):
         start = time.perf_counter_ns()
@@ -569,6 +615,8 @@ def create_shadow(vllm_config, role):
             "quantiles": QUANTILES, "max_tokens": 2048,
             "candidates": config.candidates, "scan_limit": config.scan_limit,
             "every": config.every, "threadpools": predictor.threadpools,
+            "shadow_sort_enabled": config.sort, "shadow_sort_rule": SORT_RULE,
+            "shadow_sort_timing_version": SORT_TIMING_VERSION,
             "environment": predictor.environment,
             "startup_load_ns": time.perf_counter_ns() - start})
     return Shadow(config, predictor, writer)

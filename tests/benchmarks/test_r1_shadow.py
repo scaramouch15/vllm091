@@ -8,6 +8,7 @@ these local tests never install packages, load an LLM or initialize CUDA.
 import ast
 import copy
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -67,9 +68,9 @@ class ShadowTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
 
-    def shadow(self, every=1, cap=32, scan=128):
+    def shadow(self, every=1, cap=32, scan=128, sort=False):
         config = S.ShadowConfig(self.directory / "unused", "shadow-test",
-                                self.directory, cap, scan, every)
+                                self.directory, cap, scan, every, sort)
         writer = native.C.RecordWriter(
             native.C.CollectionConfig(config.run_id, config.directory), "shadow-core")
         shadow = S.Shadow(config, FakePredictor(), writer)
@@ -99,6 +100,123 @@ class ShadowTests(unittest.TestCase):
         tree = ast.parse((ROOT / "vllm/v1/metrics/r1_shadow.py").read_text())
         self.assertFalse(any(isinstance(n, ast.Assert) for n in ast.walk(tree)))
         self.assertNotIn("random", S.__dict__)
+
+    def test_sort_config_is_independent_and_strict(self):
+        with patch.dict(os.environ, {"VLLM_R1_SHADOW": "0",
+                                     "VLLM_R1_SHADOW_SORT": "bad"}, clear=True):
+            self.assertIsNone(S.ShadowConfig.from_env())
+        env = {"VLLM_R1_SHADOW": "1", "VLLM_R1_SHADOW_MODEL": "x",
+               "VLLM_R1_SHADOW_RUN_ID": "x", "VLLM_R1_SHADOW_DIR": "x"}
+        for value, expected in (("0", False), ("1", True)):
+            with patch.dict(os.environ, dict(env, VLLM_R1_SHADOW_SORT=value), clear=True):
+                self.assertEqual(S.ShadowConfig.from_env().sort, expected)
+        with patch.dict(os.environ, dict(env, VLLM_R1_SHADOW_SORT="bad"), clear=True):
+            with self.assertRaisesRegex(ValueError, "SHADOW_SORT"):
+                S.ShadowConfig.from_env()
+
+    def test_sort_stable_independent_and_log_lifecycle(self):
+        shadow = self.shadow(sort=True)
+        waiting = native.deque([request(x) for x in ("a", "b", "c", "d")])
+        running = [request("running", native.N["RequestStatus"].RUNNING)]
+        predictions = [[1., 4., 5.], [1., 2., 5.], [1., 2., 5.], [1., 3., 5.]]
+        original = copy.deepcopy(predictions)
+        shadow.predictor.dynamic = Mock(return_value=predictions)
+        snapshot, ids = shadow.sweep(waiting, running, NS(usage=.2), 20, 3.)
+        self.assertEqual(ids, ("a", "b", "c", "d"))
+        self.assertEqual([r.request_id for r in waiting], list(ids))
+        self.assertEqual([r.request_id for r in running], ["running"])
+        self.assertEqual(predictions, original)
+        shadow.predictor.dynamic.assert_called_once()
+        rows = self.records(shadow)
+        result = next(r for r in rows if r["record_type"] == "shadow_sort")
+        original_record = next(r for r in rows if r["record_type"] == "shadow_candidates")
+        self.assertEqual(result["decision_batch_id"], snapshot["decision_batch_id"])
+        self.assertEqual(result["decision_batch_id"], original_record["snapshot"]["decision_batch_id"])
+        self.assertEqual(result["sorted_request_ids"], ["b", "c", "d", "a"])
+        self.assertEqual(result["candidate_count"], 4)
+        self.assertTrue(result["order_changed"])
+        self.assertEqual(result["rule"], S.SORT_RULE)
+        self.assertEqual(shadow.counts["sort_attempts"], 1)
+        self.assertEqual(shadow.counts["sort_success"], 1)
+        self.assertEqual(shadow.counts["sort_errors"], 0)
+        self.assertTrue(rows[-1]["clean_shutdown"])
+        self.assertTrue(rows[-1]["records_complete"])
+
+    def test_sort_single_disabled_skip_empty_and_invalid_predictions(self):
+        disabled = self.shadow()
+        disabled.sort_candidates = Mock(side_effect=AssertionError("sort called"))
+        disabled.sweep(native.deque([request("a")]), [], NS(usage=.2), 20, 3.)
+        disabled.sort_candidates.assert_not_called()
+        single = self.shadow(every=2, sort=True)
+        waiting = native.deque([request("a")])
+        single.sweep(waiting, [], NS(usage=.2), 20, 3.)
+        single.sweep(waiting, [], NS(usage=.2), 20, 3.)
+        single.sweep(native.deque(), [], NS(usage=.2), 20, 3.)
+        for invalid in (float("nan"), float("inf"), -1.):
+            single.batch = 0
+            single.predictor.dynamic = Mock(return_value=[[0., invalid, 4.]])
+            self.assertEqual(single.sweep(waiting, [], NS(usage=.2), 20, 3.)[1], ())
+        rows = self.records(single)
+        sorts = [r for r in rows if r["record_type"] == "shadow_sort"]
+        self.assertEqual(len(sorts), 1)
+        self.assertEqual(sorts[0]["sorted_request_ids"], ["a"])
+        self.assertFalse(sorts[0]["order_changed"])
+        self.assertEqual(single.counts["sort_attempts"], 1)
+        self.assertEqual(single.counts["dynamic_errors"], 3)
+
+    def test_sort_failure_keeps_prediction_and_original_scheduler_path(self):
+        shadow = self.shadow(sort=True)
+        obj = native.scheduler(waiting=[request("a"), request("b")])
+        obj.r1_shadow = shadow
+        with patch.object(S, "stable_sort_indices", side_effect=RuntimeError("private")):
+            obj.schedule()
+        self.assertEqual([r.request_id for r in obj.running], ["a", "b"])
+        self.assertEqual(shadow.counts["dynamic_success"], 1)
+        self.assertEqual(shadow.counts["dynamic_errors"], 0)
+        self.assertEqual(shadow.counts["sort_attempts"], 1)
+        self.assertEqual(shadow.counts["sort_errors"], 1)
+        rows = self.records(shadow)
+        self.assertTrue(any(r["record_type"] == "shadow_candidates" for r in rows))
+        error = next(r for r in rows if r["record_type"] == "shadow_sort_error")
+        self.assertEqual(error["error_type"], "RuntimeError")
+        self.assertNotIn("private", str(error))
+        self.assertTrue(all(r["predicted_in_this_batch"] for r in rows
+                            if r["record_type"] == "shadow_first_admission"))
+
+    def test_sort_log_drop_does_not_become_sort_failure(self):
+        shadow = self.shadow(sort=True)
+        put = shadow.writer._queue.put_nowait
+        def drop_sort(record):
+            if record["record_type"] == "shadow_sort":
+                raise queue.Full
+            return put(record)
+        with patch.object(shadow.writer._queue, "put_nowait", side_effect=drop_sort):
+            self.assertEqual(shadow.sweep(native.deque([request("a")]), [],
+                                          NS(usage=.2), 20, 3.)[1], ("a",))
+        self.assertEqual(shadow.counts["sort_success"], 1)
+        self.assertEqual(shadow.counts["sort_errors"], 0)
+        self.assertEqual(shadow.counts["log_dropped"], 1)
+        rows = self.records(shadow)
+        self.assertFalse(rows[-1]["records_complete"])
+        self.assertEqual(rows[-1]["metrics"]["dropped_records"], 1)
+
+    def test_sort_timing_preserves_old_boundary_and_covers_foreground(self):
+        results = []
+        for enabled in (False, True):
+            shadow = self.shadow(sort=enabled)
+            clock = iter(range(0, 10000, 10))
+            emitted = []
+            shadow.emit = lambda kind, record: emitted.append((kind, record))
+            with patch.object(S.time, "perf_counter_ns", side_effect=lambda: next(clock)):
+                shadow.sweep(native.deque([request("a")]), [], NS(usage=.2), 20, 3.)
+            candidate = next(record for kind, record in emitted if kind == "shadow_candidates")
+            dynamic = shadow.duration_report()["overall"]["dynamic_foreground"]["total_ns"]
+            results.append((candidate["shadow_compute_ns"], dynamic, emitted))
+        self.assertEqual(results[0][0], results[1][0])
+        self.assertGreater(results[1][1], results[0][1])
+        sort = next(record for kind, record in results[1][2] if kind == "shadow_sort")
+        self.assertGreaterEqual(sort["sort_total_ns"],
+                                sort["key_construct_ns"] + sort["stable_sort_ns"] + sort["id_construct_ns"])
 
     def test_startup_wrong_model_rejected_before_deserialization(self):
         wrong = self.directory / "bad.joblib"
@@ -132,6 +250,9 @@ class ShadowTests(unittest.TestCase):
         rows = self.records(shadow)
         self.assertEqual(rows[0]["role"], "shadow-frontend")
         self.assertEqual(rows[0]["metadata"]["environment"], predictor.environment)
+        self.assertFalse(rows[0]["metadata"]["shadow_sort_enabled"])
+        self.assertEqual(rows[0]["metadata"]["shadow_sort_rule"], S.SORT_RULE)
+        self.assertEqual(rows[0]["metadata"]["shadow_sort_timing_version"], 1)
         self.assertGreaterEqual(rows[0]["metadata"]["startup_load_ns"], 0)
 
     def test_static_once_per_request_no_text_cache_or_whitespace_changes(self):
