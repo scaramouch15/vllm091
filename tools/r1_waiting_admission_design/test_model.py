@@ -1,7 +1,7 @@
 """CPU-only contract tests for the isolated state model."""
 import unittest
 
-from model import Prediction, Request, run_round
+from model import Prediction, Request, eligible_prefix, run_round
 
 
 def ids(requests):
@@ -13,7 +13,7 @@ class WaitingModelTests(unittest.TestCase):
                  capacity=10, tokens=10, opportunity=True, preempted=False,
                  prediction=None, prediction_failed=False):
         if prediction is None and scores is not None:
-            prediction = Prediction(round_id, tuple(scores))
+            prediction = Prediction(round_id, ids(eligible_prefix(requests, limit)), tuple(scores))
         result = run_round(requests, round_id=round_id, limit=limit,
                            capacity=capacity, token_budget=tokens,
                            prediction=prediction, prediction_failed=prediction_failed,
@@ -36,9 +36,14 @@ class WaitingModelTests(unittest.TestCase):
 
     def test_no_reorder_skip_failed_invalid_stale(self):
         requests = [Request(x) for x in "abc"]
-        for prediction, opportunity in ((None, True), (Prediction(1, (3, 1, 2)), False),
-                (Prediction(0, (3, 1, 2)), True), (Prediction(1, (3, float("nan"), 2)), True),
-                (Prediction(1, (3, float("inf"), 2)), True), (Prediction(1, (3,)), True)):
+        prefix = ("a", "b", "c")
+        for prediction, opportunity in ((None, True), (Prediction(1, prefix, (3, 1, 2)), False),
+                (Prediction(0, prefix, (3, 1, 2)), True),
+                (Prediction(1, prefix, (3, float("nan"), 2)), True),
+                (Prediction(1, prefix, (3, float("inf"), 2)), True),
+                (Prediction(1, prefix, (3, -1, 2)), True),
+                (Prediction(1, prefix, (3, True, 2)), True),
+                (Prediction(1, prefix, (3,)), True)):
             with self.subTest(prediction=prediction, opportunity=opportunity):
                 out = self.run_case(requests, prediction=prediction, opportunity=opportunity, capacity=2)
                 self.assertEqual(out.decision, "native")
@@ -47,7 +52,7 @@ class WaitingModelTests(unittest.TestCase):
         preempted = self.run_case(requests, [3, 1, 2], preempted=True)
         self.assertEqual(preempted.stop, "preempted")
         self.assertEqual(ids(preempted.waiting), ("a", "b", "c"))
-        failure = self.run_case(requests, prediction=Prediction(1, (9, 3, 1)),
+        failure = self.run_case(requests, prediction=Prediction(1, prefix, (9, 3, 1)),
                                 prediction_failed=True, capacity=2)
         self.assertEqual(failure.decision, "native")
         self.assertEqual(failure.admitted, ("a", "b"))
@@ -107,13 +112,29 @@ class WaitingModelTests(unittest.TestCase):
         self.assertEqual(second.admitted, ("b",))
         self.assertEqual(ids(second.waiting), ("c", "d", "new"))
         stale = self.run_case(second.waiting, round_id=3, capacity=1,
-                              prediction=Prediction(2, (99, 1, 0)))
+                              prediction=Prediction(2, ("c", "d", "new"), (99, 1, 0)))
         self.assertEqual(stale.decision, "native")
         self.assertEqual(stale.admitted, ("c",))
 
     def test_unsupported_candidate_skip_rejected(self):
         with self.assertRaisesRegex(ValueError, "cannot be candidate"):
             self.run_case([Request("x", True, "skip")], [1])
+
+    def test_prediction_ordered_identity_and_fallback(self):
+        requests = [Request(x) for x in "abcd"]
+        for supplied in (("a", "c", "b", "d"), ("a", "b", "c", "other"),
+                         ("a", "b", "b", "d"), ("a", "b", "c"),
+                         ("a", "b", "c", "d", "extra")):
+            with self.subTest(candidate_ids=supplied):
+                result = self.run_case(requests, prediction=Prediction(1, supplied, (9, 3, 1, 1)),
+                                       capacity=2)
+                self.assertEqual(result.decision, "native")
+                self.assertEqual(result.attempted, ("a", "b"))
+                self.assertEqual(ids(result.waiting), ("c", "d"))
+        matched = self.run_case(requests, prediction=Prediction(1, ("a", "b", "c", "d"),
+                                                                (9, 3, 1, 1)))
+        self.assertEqual(matched.decision, "reordered")
+        self.assertEqual(matched.attempted, ("a", "c", "d", "b"))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ class Request:
 @dataclass(frozen=True)
 class Prediction:
     round_id: int
+    candidate_ids: tuple
     scores: tuple
 
 
@@ -50,8 +51,8 @@ def run_round(waiting, *, round_id, limit, capacity, token_budget,
               prediction=None, prediction_failed=False, opportunity=True, preempted=False):
     """Model one synchronous round; caller appends/aborts only between rounds.
 
-    `prediction` is artificial and must be for this round and this exact
-    prefix length; it is never stored. capacity/tokens are abstract counts.
+    `prediction` is artificial and must match this round and the exact ordered
+    prefix IDs; it is never stored. capacity/tokens are abstract counts.
     `prediction_failed` represents a failure before any queue change.
     Any native_action=skip is assumed not ready throughout this round.
     """
@@ -68,7 +69,15 @@ def run_round(waiting, *, round_id, limit, capacity, token_budget,
     if (not prediction_failed and candidates and isinstance(prediction, Prediction)
             and prediction.round_id == round_id):
         scores = prediction.scores
-        valid = (len(scores) == len(candidates) and
+        expected_ids = tuple(r.request_id for r in candidates)
+        predicted_ids = prediction.candidate_ids
+        valid = (isinstance(predicted_ids, tuple)
+                 and all(isinstance(rid, str) for rid in predicted_ids)
+                 and len(predicted_ids) == len(candidates)
+                 and len(set(predicted_ids)) == len(predicted_ids)
+                 and predicted_ids == expected_ids
+                 and isinstance(scores, tuple)
+                 and len(scores) == len(candidates) and
                  all(not isinstance(s, bool) and isinstance(s, (int, float))
                      and math.isfinite(s) and s >= 0 for s in scores))
         if valid:
