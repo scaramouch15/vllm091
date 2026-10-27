@@ -52,7 +52,7 @@ def measure(layer, n, scores, attempts, method, batch):
     # All independent input state allocation and preparation is outside timing.
     if layer == "pure":
         entries = [(score, i, i) for i, score in enumerate(scores)]
-        workloads = [entries] * batch  # immutable inputs; selector makes its own structure
+        workloads = [entries.copy() for _ in range(batch)]
     else:
         workloads = [fresh_waiting(n) for _ in range(batch)]
     start = time.perf_counter_ns()
@@ -62,7 +62,7 @@ def measure(layer, n, scores, attempts, method, batch):
     else:
         for waiting in workloads:
             maintain_window(waiting, scores, attempts, attempts, None, method)
-    return (time.perf_counter_ns() - start) / batch
+    return time.perf_counter_ns() - start
 
 
 def main():
@@ -104,14 +104,16 @@ def main():
                 for offset in range(3):
                     name = names[(case_index + w + offset) % 3]
                     measure(actual_layer, n, scores, a, METHODS[name], 1)
-            samples = {name: [] for name in names}
+            elapsed = {name: [] for name in names}
             orders = []
             for rep in range(args.repeats):
                 order = [names[(case_index + rep + offset) % 3] for offset in range(3)]
                 orders.append(order)
                 for name in order:
-                    samples[name].append(measure(actual_layer, n, scores, a,
+                    elapsed[name].append(measure(actual_layer, n, scores, a,
                                                  METHODS[name], args.batch))
+            samples = {name: [value / args.batch for value in values]
+                       for name, values in elapsed.items()}
             summary = {name: {"median_ns_per_call": statistics.median(values),
                               "p95_batch_mean_ns_per_call": percentile(values, 95),
                               "p99_batch_mean_ns_per_call": percentile(values, 99),
@@ -119,6 +121,7 @@ def main():
                        for name, values in samples.items()}
             rows.append({"layer": layer, "N": n, "K": k, "A": a, "M": a,
                          "distribution": kind, "order_by_repeat": orders,
+                         "raw_batch_elapsed_ns": elapsed,
                          "raw_batch_mean_ns_per_call": samples, "summary": summary})
     finally:
         if gc_initial:
