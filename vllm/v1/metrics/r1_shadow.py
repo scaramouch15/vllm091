@@ -597,6 +597,14 @@ class Shadow:
 
 
 def create_shadow(vllm_config, role):
+    if os.environ.get("VLLM_R1_ADMISSION_MODE", "off") != "off":
+        from vllm.v1.core.sched.r1_admission import (AdmissionConfig,
+                                                    unsupported_reason)
+        AdmissionConfig.from_env()
+        reason = unsupported_reason(vllm_config)
+        if reason is not None:
+            logger.warning("R1 admission and shadow disabled; native fallback: %s", reason)
+            return None
     config = ShadowConfig.from_env()
     if config is None:
         return None

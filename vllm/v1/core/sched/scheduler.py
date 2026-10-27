@@ -177,12 +177,42 @@ class Scheduler(SchedulerInterface):
             })
 
         import os
+        self.r1_admission_mode = os.environ.get("VLLM_R1_ADMISSION_MODE", "off")
+        self.r1_admission = None
+        admission_config = None
+        if (self.r1_admission_mode != "off" or
+                "VLLM_R1_ADMISSION_EVERY" in os.environ or
+                "VLLM_R1_ADMISSION_PREFIX_LIMIT" in os.environ):
+            from vllm.v1.core.sched.r1_admission import AdmissionConfig
+            admission_config = AdmissionConfig.from_env()
         self.r1_shadow = None
         if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
             from vllm.v1.metrics.r1_shadow import create_shadow
             self.r1_shadow = create_shadow(vllm_config, "core")
+        if admission_config is not None and admission_config.mode != "off":
+            from vllm.v1.core.sched.r1_admission import (AdmissionController,
+                                                        unsupported_reason)
+            reason = unsupported_reason(vllm_config)
+            if reason is None and self.r1_shadow is None:
+                reason = "shadow_disabled"
+            if reason is not None:
+                logger.warning("R1 admission disabled; native fallback: %s", reason)
+            else:
+                from vllm.v1.metrics.r1_shadow import valid_lengths
+                self.r1_admission = AdmissionController(admission_config,
+                                                        self.r1_shadow, valid_lengths)
 
     def schedule(self) -> SchedulerOutput:
+        admission = getattr(self, "r1_admission", None)
+        if admission is None:
+            return self._schedule()
+        started = time.perf_counter_ns()
+        frame = admission.begin()
+        result = self._schedule(frame)
+        admission.finish(frame, started)
+        return result
+
+    def _schedule(self, admission_frame=None) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -354,7 +384,12 @@ class Scheduler(SchedulerInterface):
         # This is after running scheduling, before waiting admission, not after GPU execution.
         shadow = getattr(self, "r1_shadow", None)
         shadow_decision = None
-        if (shadow is not None and not preempted_reqs and self.waiting
+        admission = getattr(self, "r1_admission", None)
+        if admission_frame is not None:
+            shadow_decision = admission.prepare(self, admission_frame, preempted_reqs,
+                                                token_budget, scheduled_timestamp)
+        elif (getattr(self, "r1_admission_mode", "off") == "off"
+                and shadow is not None and not preempted_reqs and self.waiting
                 and token_budget > 0
                 and len(self.running) < self.max_num_running_reqs):
             shadow_decision = shadow.sweep(
@@ -367,6 +402,8 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting[0]
+                if admission_frame is not None:
+                    admission.attempt(admission_frame, request)
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -459,6 +496,8 @@ class Scheduler(SchedulerInterface):
                              encoder_budget)
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if admission_frame is not None:
+                                admission_frame["exit_reason"] = "encoder_budget"
                             break
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
@@ -471,6 +510,8 @@ class Scheduler(SchedulerInterface):
                 )
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if admission_frame is not None:
+                        admission_frame["exit_reason"] = "kv_allocation_failed"
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -497,6 +538,8 @@ class Scheduler(SchedulerInterface):
                         request.request_id] = req_index
                 req_index += 1
                 self.running.append(request)
+                if admission_frame is not None:
+                    admission.admitted(admission_frame, request)
                 if self.log_stats:
                     request.record_event(EngineCoreEventType.SCHEDULED,
                                          scheduled_timestamp)
@@ -534,6 +577,15 @@ class Scheduler(SchedulerInterface):
                         self.encoder_cache_manager.allocate(request, i)
                     encoder_budget = new_encoder_budget
 
+        if admission_frame is not None:
+            if admission_frame["exit_reason"] is None:
+                admission_frame["exit_reason"] = (
+                    "preempted" if preempted_reqs else
+                    "waiting_empty" if not self.waiting else
+                    "token_budget" if token_budget <= 0 else
+                    "capacity" if len(self.running) >= self.max_num_running_reqs else
+                    "waiting_complete")
+            admission.restore(self, admission_frame, skipped_waiting_requests)
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.extendleft(skipped_waiting_requests)
