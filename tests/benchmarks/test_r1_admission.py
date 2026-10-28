@@ -45,7 +45,7 @@ def req(name, status=None, lengths=(1., 2., 3.)):
 
 class AdmissionTests(unittest.TestCase):
     def setup_scheduler(self, mode="apply", names="abcd", scores=None, every=1, limit=32,
-                        skip_single_slot=False):
+                        skip_single_slot=False, head_policy="protected"):
         requests = [req(x) for x in names]
         obj = native.scheduler(waiting=requests)
         predictor = Predictor(scores or {"a": 9, "b": 3, "c": 1, "d": 1})
@@ -54,12 +54,163 @@ class AdmissionTests(unittest.TestCase):
         obj.r1_shadow = shadow
         obj.r1_admission_mode = mode
         obj.r1_admission = (None if mode == "off" else
-                            A.AdmissionController(A.AdmissionConfig(mode, every, limit, skip_single_slot),
+                            A.AdmissionController(A.AdmissionConfig(mode, every, limit, skip_single_slot,
+                                                                    head_policy),
                                                   shadow, S.valid_lengths))
         return obj, predictor, writer
 
     def event(self, writer):
         return [v for k, v in writer.rows if k == "r1_admission_v1"][-1]
+
+    def test_head_policy_defaults_and_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(A.AdmissionConfig.from_env().head_policy, "protected")
+        for mode in ("observe", "apply"):
+            with patch.dict(os.environ, {"VLLM_R1_ADMISSION_MODE": mode,
+                "VLLM_R1_ADMISSION_HEAD_POLICY": "ranked",
+                "VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "1"}, clear=True):
+                with self.assertRaisesRegex(ValueError, "conflict"):
+                    A.AdmissionConfig.from_env()
+        for policy in ("", "bad", "RANKED"):
+            with patch.dict(os.environ, {"VLLM_R1_ADMISSION_HEAD_POLICY": policy}, clear=True):
+                with self.assertRaisesRegex(ValueError, "HEAD_POLICY"):
+                    A.AdmissionConfig.from_env()
+        with patch.dict(os.environ, {"VLLM_R1_ADMISSION_MODE": "off",
+             "VLLM_R1_ADMISSION_HEAD_POLICY": "ranked",
+             "VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "1"}, clear=True):
+            self.assertEqual(A.AdmissionConfig.from_env().head_policy, "ranked")
+        obj, pred, writer = self.setup_scheduler(mode="off", head_policy="ranked", skip_single_slot=True)
+        obj.max_num_running_reqs = 1
+        obj.schedule()
+        self.assertEqual([r.request_id for r in obj.running], ["a"])
+        self.assertEqual(pred.calls, 1)  # Existing shadow path is unchanged.
+        self.assertFalse(any(k == "r1_admission_v1" for k, _ in writer.rows))
+
+    def test_ranked_single_slot_stable_and_observe(self):
+        for mode, expected in (("observe", "a"), ("apply", "c")):
+            obj, pred, writer = self.setup_scheduler(mode=mode, head_policy="ranked")
+            obj.max_num_running_reqs = 1
+            obj.schedule()
+            row = self.event(writer)
+            self.assertEqual(pred.calls, 1)
+            self.assertEqual(row["head_policy"], "ranked")
+            self.assertEqual(row["score_rule"], "all_p90_ascending_stable_v1")
+            self.assertEqual(row["sorted_ids"], ("c", "d", "b", "a"))
+            self.assertEqual(row["actual_admission_order"], [expected])
+            self.assertEqual([r.request_id for r in obj.running], [expected])
+            self.assertEqual([r.request_id for r in obj.waiting], [x for x in "abcd" if x != expected])
+            self.assertEqual(row["applied_order_changed"], mode == "apply")
+
+    def test_ranked_all_equal_preserves_order(self):
+        obj, _, writer = self.setup_scheduler(head_policy="ranked", scores={x: 1 for x in "abcd"})
+        obj.max_num_running_reqs = 2
+        obj.schedule()
+        self.assertEqual(self.event(writer)["sorted_ids"], tuple("abcd"))
+        self.assertEqual([r.request_id for r in obj.running], ["a", "b"])
+        self.assertEqual([r.request_id for r in obj.waiting], ["c", "d"])
+
+    def test_ranked_capacity_token_and_kv_failure_restoration(self):
+        for failed, capacity, budget, admitted, attempted, remaining in (
+            (None, 2, 20, ["c", "d"], ["c", "d"], ["a", "b"]),
+            (None, 8, 6, ["c", "d"], ["c", "d"], ["a", "b"]),
+            ("c", 8, 20, [], ["c"], ["a", "b", "c", "d"]),
+            ("d", 8, 20, ["c"], ["c", "d"], ["a", "b", "d"])):
+            with self.subTest(failed=failed, capacity=capacity, budget=budget):
+                obj, _, writer = self.setup_scheduler(head_policy="ranked")
+                obj.max_num_running_reqs, obj.max_num_scheduled_tokens = capacity, budget
+                if failed: obj.kv_cache_manager.fail.add(failed)
+                obj.kv_cache_manager.free = Mock(wraps=obj.kv_cache_manager.free)
+                obj.schedule()
+                row = self.event(writer)
+                self.assertEqual([r.request_id for r in obj.running], admitted)
+                self.assertEqual([r.request_id for r in obj.waiting], remaining)
+                self.assertEqual(row["window_attempts"], attempted)
+                self.assertEqual(sorted(admitted + remaining), list("abcd"))
+                self.assertEqual(obj.kv_cache_manager.free.call_count, 0)
+                if failed:
+                    self.assertEqual(row["exit_reason"], "kv_allocation_failed")
+
+    def test_ranked_native_kv_exception_propagates(self):
+        obj, _, _ = self.setup_scheduler(head_policy="ranked")
+        obj.kv_cache_manager.allocate_slots = Mock(side_effect=RuntimeError("native KV"))
+        with self.assertRaisesRegex(RuntimeError, "native KV"):
+            obj.schedule()
+
+    def test_ranked_window_barriers_and_preemption(self):
+        obj, pred, writer = self.setup_scheduler(head_policy="ranked", limit=2)
+        obj.max_num_running_reqs = 1
+        obj.schedule()
+        self.assertEqual(self.event(writer)["candidate_ids"], ("a", "b"))
+        self.assertEqual(self.event(writer)["actual_admission_order"], ["b"])
+        self.assertEqual([r.request_id for r in obj.waiting], ["a", "c", "d"])
+        self.assertEqual(pred.calls, 1)
+        obj, pred, writer = self.setup_scheduler(head_policy="ranked")
+        obj.waiting[0].status = native.N["RequestStatus"].WAITING_FOR_FSM
+        obj.waiting[0].structured_output_request = None
+        obj.max_num_running_reqs = 1
+        obj.schedule()
+        self.assertEqual(self.event(writer)["reason"], "empty_prefix")
+        self.assertEqual([r.request_id for r in obj.running], ["b"])
+        self.assertEqual([r.request_id for r in obj.waiting], ["a", "c", "d"])
+        self.assertEqual(pred.calls, 0)
+        obj, pred, writer = self.setup_scheduler(head_policy="ranked")
+        obj.waiting[2].status = native.N["RequestStatus"].WAITING_FOR_FSM
+        obj.waiting[2].structured_output_request = None
+        obj.schedule()
+        row = self.event(writer)
+        self.assertEqual(row["candidate_ids"], ("a", "b"))
+        self.assertEqual(row["actual_admission_order"], ["b", "a", "d"])
+        self.assertEqual([r.request_id for r in obj.waiting], ["c"])
+        obj, pred, writer = self.setup_scheduler(head_policy="ranked")
+        running = req("running", native.N["RequestStatus"].RUNNING)
+        obj.running.append(running)
+        obj.requests["running"] = running
+        obj.kv_cache_manager.fail.add("running")
+        obj.schedule()
+        self.assertEqual(pred.calls, 0)
+        self.assertEqual(self.event(writer)["reason"], "preempted")
+        self.assertEqual([r.request_id for r in obj.waiting], ["running", "a", "b", "c", "d"])
+
+    def test_ranked_long_tail_is_not_scanned(self):
+        obj, _, writer = self.setup_scheduler(head_policy="ranked", limit=3)
+        tail = [req("tail-" + str(i)) for i in range(3000)]
+        class BoundedDeque(deque):
+            def __iter__(self):
+                for i, value in enumerate(super().__iter__()):
+                    if i >= 3: raise AssertionError("scanned beyond window")
+                    yield value
+        obj.waiting = BoundedDeque([*obj.waiting, *tail])
+        obj.max_num_running_reqs = 1
+        obj.schedule()
+        self.assertEqual(self.event(writer)["actual_admission_order"], ["c"])
+        self.assertEqual(len(obj.waiting), 3003)
+
+    def test_ranked_prediction_failure_interval_and_footer(self):
+        obj, pred, writer = self.setup_scheduler(head_policy="ranked", every=2)
+        pred.dynamic = Mock(side_effect=ValueError("failure"))
+        obj.kv_cache_manager.fail.add("a")
+        obj.schedule()
+        self.assertEqual(self.event(writer)["reason"], "prediction_failed")
+        self.assertEqual([r.request_id for r in obj.waiting], list("abcd"))
+        obj.schedule()
+        self.assertEqual(self.event(writer)["reason"], "interval_skip")
+        pred.dynamic.assert_called_once()
+        with tempfile.TemporaryDirectory(prefix="r1-ranked-", dir=native.ROOT) as tmp:
+            path = Path(tmp)
+            disk = native.C.RecordWriter(native.C.CollectionConfig("ranked", path), "shadow-core")
+            obj, predictor, _ = self.setup_scheduler(head_policy="ranked")
+            shadow = S.Shadow(S.ShadowConfig(path / "unused", "ranked", path), predictor, disk)
+            obj.r1_shadow = shadow
+            obj.r1_admission = A.AdmissionController(A.AdmissionConfig("apply", 1, 32, False, "ranked"), shadow, S.valid_lengths)
+            obj.max_num_running_reqs = 1
+            obj.schedule()
+            self.assertTrue(shadow.close())
+            rows = [json.loads(line) for line in disk.path.read_text("utf-8").splitlines()]
+            row = next(r for r in rows if r["record_type"] == "r1_admission_v1")
+            self.assertEqual(row["head_policy"], "ranked")
+            self.assertEqual(row["window_admitted"], ["c"])
+            self.assertTrue(rows[-1]["clean_shutdown"])
+            self.assertTrue(rows[-1]["records_complete"])
 
     def test_off_observe_apply(self):
         for mode, expected in (("off", ["a", "b", "c"]),
@@ -75,6 +226,8 @@ class AdmissionTests(unittest.TestCase):
                 self.assertEqual(pred.calls, 1)
                 if mode != "off":
                     row = self.event(writer)
+                    self.assertEqual(row["head_policy"], "protected")
+                    self.assertEqual(row["score_rule"], "head_then_p90_ascending_stable_v1")
                     self.assertEqual(row["sorted_ids"], ("a", "c", "d", "b"))
                     self.assertEqual(row["window_A"], 3)
                     self.assertEqual(row["window_M"], 3)
@@ -504,6 +657,15 @@ class AdmissionTests(unittest.TestCase):
                     ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
             with patch.dict(os.environ, {"VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "invalid"}, clear=True):
                 with self.assertRaisesRegex(ValueError, "SKIP_SINGLE_SLOT"):
+                    ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
+            for mode in ("observe", "apply"):
+                with patch.dict(os.environ, {"VLLM_R1_ADMISSION_MODE": mode,
+                    "VLLM_R1_ADMISSION_HEAD_POLICY": "ranked",
+                    "VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "1"}, clear=True):
+                    with self.assertRaisesRegex(ValueError, "conflict"):
+                        ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
+            with patch.dict(os.environ, {"VLLM_R1_ADMISSION_HEAD_POLICY": "bad"}, clear=True):
+                with self.assertRaisesRegex(ValueError, "HEAD_POLICY"):
                     ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
             with patch.dict(os.environ, {"VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "1"}, clear=True):
                 obj = ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())

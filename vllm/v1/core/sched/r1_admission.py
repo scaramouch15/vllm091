@@ -14,6 +14,13 @@ class AdmissionConfig:
     every: int
     prefix_limit: int
     skip_single_slot: bool = False
+    head_policy: str = "protected"
+
+    def __post_init__(self):
+        if self.head_policy not in ("protected", "ranked"):
+            raise ValueError("VLLM_R1_ADMISSION_HEAD_POLICY must be protected or ranked")
+        if self.mode in ("observe", "apply") and self.head_policy == "ranked" and self.skip_single_slot:
+            raise ValueError("ranked head policy conflicts with VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT=1 in observe/apply")
 
     @classmethod
     def from_env(cls):
@@ -30,7 +37,8 @@ class AdmissionConfig:
         skip = os.environ.get("VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT", "0")
         if skip not in ("0", "1"):
             raise ValueError("VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT must be 0 or 1")
-        return cls(mode, every, limit, skip == "1")
+        head_policy = os.environ.get("VLLM_R1_ADMISSION_HEAD_POLICY", "protected")
+        return cls(mode, every, limit, skip == "1", head_policy)
 
 
 def unsupported_reason(config):
@@ -82,7 +90,10 @@ class AdmissionController:
         return {"schema_version": 1, "mode": self.config.mode,
                 "every": self.config.every, "prefix_limit": self.config.prefix_limit,
                 "skip_single_slot": self.config.skip_single_slot,
-                "score_rule": "head_then_p90_ascending_stable_v1",
+                "head_policy": self.config.head_policy,
+                "score_rule": ("head_then_p90_ascending_stable_v1"
+                               if self.config.head_policy == "protected" else
+                               "all_p90_ascending_stable_v1"),
                 "instance_id": self.instance_id, "schedule_id": self.schedules,
                 "opportunity_id": None, "waiting_size": None, "checked": 0,
                 "running_count": None, "kv_usage": None, "token_budget": None,
@@ -205,7 +216,10 @@ class AdmissionController:
                     or len(actual) != len(candidates)
                     or any(a is not b for a, b in zip(actual, candidates))):
                 raise ValueError("decision identity or prefix mismatch")
-            order = [0, *sorted(range(1, len(ids)), key=lambda i: (decision.scores[i], i))]
+            if self.config.head_policy == "protected":
+                order = [0, *sorted(range(1, len(ids)), key=lambda i: (decision.scores[i], i))]
+            else:
+                order = sorted(range(len(ids)), key=lambda i: (decision.scores[i], i))
             ordered = tuple(candidates[i] for i in order)
             frame["sorted_ids"] = tuple(r.request_id for r in ordered)
             frame["scores_p90"] = decision.scores
