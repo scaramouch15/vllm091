@@ -1,5 +1,8 @@
 """CPU integration tests for native QUEUED time reuse."""
 from dataclasses import replace
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -93,6 +96,23 @@ class TimeTests(base.AdmissionTests):
         with self.assertRaisesRegex(RuntimeError, "native KV"):
             obj.schedule()
         self.assertFalse(any(k == "shadow_terminal" for k, _ in writer.rows))
+
+    def test_time_record_real_writer_and_footer(self):
+        with tempfile.TemporaryDirectory(prefix="r1-time-", dir=base.native.ROOT) as tmp:
+            path = Path(tmp)
+            writer = base.native.C.RecordWriter(base.native.C.CollectionConfig("time", path), "shadow-core")
+            obj, predictor, _ = self.setup_time()
+            shadow = base.S.Shadow(base.S.ShadowConfig(path / "unused", "time", path), predictor, writer)
+            obj.r1_shadow = shadow
+            obj.r1_admission.shadow = shadow
+            obj.max_num_running_reqs = 1
+            obj.schedule()
+            self.assertTrue(shadow.close())
+            rows = [json.loads(line) for line in writer.path.read_text("utf-8").splitlines()]
+            row = next(r for r in rows if r["record_type"] == "r1_admission_v1")
+            self.assertEqual(row["head_queued_status"], "available")
+            self.assertTrue(rows[-1]["clean_shutdown"])
+            self.assertTrue(rows[-1]["records_complete"])
 
 
 if __name__ == "__main__":
