@@ -13,6 +13,7 @@ class AdmissionConfig:
     mode: str
     every: int
     prefix_limit: int
+    skip_single_slot: bool = False
 
     @classmethod
     def from_env(cls):
@@ -26,7 +27,10 @@ class AdmissionConfig:
             raise ValueError("admission EVERY and PREFIX_LIMIT must be integers") from exc
         if every <= 0 or not 1 <= limit <= 4096:
             raise ValueError("admission requires EVERY > 0 and 1 <= PREFIX_LIMIT <= 4096")
-        return cls(mode, every, limit)
+        skip = os.environ.get("VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT", "0")
+        if skip not in ("0", "1"):
+            raise ValueError("VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT must be 0 or 1")
+        return cls(mode, every, limit, skip == "1")
 
 
 def unsupported_reason(config):
@@ -77,10 +81,12 @@ class AdmissionController:
         self.schedules += 1
         return {"schema_version": 1, "mode": self.config.mode,
                 "every": self.config.every, "prefix_limit": self.config.prefix_limit,
+                "skip_single_slot": self.config.skip_single_slot,
                 "score_rule": "head_then_p90_ascending_stable_v1",
                 "instance_id": self.instance_id, "schedule_id": self.schedules,
                 "opportunity_id": None, "waiting_size": None, "checked": 0,
                 "running_count": None, "kv_usage": None, "token_budget": None,
+                "available_running_slots": None,
                 "candidate_count": 0, "candidate_ids": (), "sorted_ids": (),
                 "scores_p90": (), "prefix_stop": "not_scanned",
                 "order_changed": False, "applied_order_changed": False,
@@ -118,6 +124,8 @@ class AdmissionController:
         start = time.perf_counter_ns()
         frame["waiting_size"] = len(scheduler.waiting)
         frame["token_budget"] = token_budget
+        frame["available_running_slots"] = (scheduler.max_num_running_reqs -
+                                            len(scheduler.running))
         reason = ("preempted" if preempted else
                   "empty_waiting" if not scheduler.waiting else
                   "token_budget" if token_budget <= 0 else
@@ -150,6 +158,26 @@ class AdmissionController:
         frame["_candidates"] = tuple(candidates)
         frame["candidate_ids"] = tuple(r.request_id for r in candidates)
         frame["_candidate_set"] = frozenset(frame["candidate_ids"])
+        if self.config.skip_single_slot and frame["available_running_slots"] == 1:
+            # Preserve the real pre-admission snapshot separately from the empty
+            # set of IDs predicted in this batch; no model or ordering work.
+            try:
+                running_count = len(scheduler.running)
+                kv_usage = float(scheduler.kv_cache_manager.usage)
+                if not math.isfinite(kv_usage) or not 0 <= kv_usage <= 1:
+                    raise ValueError("invalid KV usage")
+                frame["running_count"], frame["kv_usage"] = running_count, kv_usage
+                snapshot = {"decision_batch_id": f"{self.instance_id}:{frame['schedule_id']}",
+                            "scheduled_timestamp": timestamp, "running_count": running_count,
+                            "kv_usage": kv_usage, "token_budget": int(token_budget)}
+            except Exception as exc:
+                frame["reason"] = "snapshot_failed"
+                frame["error_type"] = type(exc).__name__
+                frame["trigger_prefix_ns"] = time.perf_counter_ns() - start
+                return None
+            frame["reason"] = "single_slot_skip"
+            frame["trigger_prefix_ns"] = time.perf_counter_ns() - start
+            return snapshot, ()
         started = time.perf_counter_ns()
         try:
             running_count, kv_usage = len(scheduler.running), float(scheduler.kv_cache_manager.usage)

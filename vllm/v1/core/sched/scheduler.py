@@ -182,7 +182,8 @@ class Scheduler(SchedulerInterface):
         admission_config = None
         if (self.r1_admission_mode != "off" or
                 "VLLM_R1_ADMISSION_EVERY" in os.environ or
-                "VLLM_R1_ADMISSION_PREFIX_LIMIT" in os.environ):
+                "VLLM_R1_ADMISSION_PREFIX_LIMIT" in os.environ or
+                "VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT" in os.environ):
             from vllm.v1.core.sched.r1_admission import AdmissionConfig
             admission_config = AdmissionConfig.from_env()
         self.r1_shadow = None

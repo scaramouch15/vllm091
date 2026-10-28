@@ -44,7 +44,8 @@ def req(name, status=None, lengths=(1., 2., 3.)):
 
 
 class AdmissionTests(unittest.TestCase):
-    def setup_scheduler(self, mode="apply", names="abcd", scores=None, every=1, limit=32):
+    def setup_scheduler(self, mode="apply", names="abcd", scores=None, every=1, limit=32,
+                        skip_single_slot=False):
         requests = [req(x) for x in names]
         obj = native.scheduler(waiting=requests)
         predictor = Predictor(scores or {"a": 9, "b": 3, "c": 1, "d": 1})
@@ -53,7 +54,7 @@ class AdmissionTests(unittest.TestCase):
         obj.r1_shadow = shadow
         obj.r1_admission_mode = mode
         obj.r1_admission = (None if mode == "off" else
-                            A.AdmissionController(A.AdmissionConfig(mode, every, limit),
+                            A.AdmissionController(A.AdmissionConfig(mode, every, limit, skip_single_slot),
                                                   shadow, S.valid_lengths))
         return obj, predictor, writer
 
@@ -85,6 +86,177 @@ class AdmissionTests(unittest.TestCase):
                     self.assertFalse(any(k == "r1_admission_v1" for k, _ in writer.rows))
                 self.assertEqual([r.request_id for r in obj.waiting],
                                  [x for x in "abcd" if x not in expected])
+
+    def test_single_slot_success_and_failure_preserve_native_resources(self):
+        for mode in ("observe", "apply"):
+            for fail in (False, True):
+                outcomes = []
+                for enabled in (False, True):
+                    with self.subTest(mode=mode, fail=fail, enabled=enabled):
+                        obj, pred, writer = self.setup_scheduler(mode=mode, skip_single_slot=enabled)
+                        running = req("running", native.N["RequestStatus"].RUNNING)
+                        # This running request receives no tokens this step. It still
+                        # occupies a slot; scheduled_running_reqs is therefore zero.
+                        running.num_computed_tokens = running.num_tokens
+                        obj.running.append(running)
+                        obj.requests[running.request_id] = running
+                        obj.max_num_running_reqs = 2
+                        if fail:
+                            obj.kv_cache_manager.fail.add("a")
+                        obj.kv_cache_manager.free = Mock(wraps=obj.kv_cache_manager.free)
+                        obj.kv_cache_manager.free_block_hashes = Mock(wraps=obj.kv_cache_manager.free_block_hashes)
+                        pred.assemble = Mock(wraps=pred.assemble)
+                        obj.r1_shadow.sweep = Mock(side_effect=AssertionError("old shadow sweep"))
+                        with patch.object(native.time, "monotonic", return_value=123.0):
+                            output = obj.schedule()
+                        row = self.event(writer)
+                        outcomes.append(([r.request_id for r in obj.running],
+                            [r.request_id for r in obj.waiting], output.num_scheduled_tokens,
+                            list(obj.kv_cache_manager.allocations), list(obj.kv_cache_manager.cache_queries),
+                            obj.kv_cache_manager.free.call_count, obj.kv_cache_manager.free_block_hashes.call_count,
+                            obj.kv_cache_manager.usage_reads))
+                        self.assertEqual(pred.calls, 0 if enabled else 1)
+                        self.assertEqual(pred.assemble.call_count, 0 if enabled else 1)
+                        self.assertEqual(row["available_running_slots"], 1)
+                        self.assertEqual(row["skip_single_slot"], enabled)
+                        self.assertEqual(row["reason"], "single_slot_skip" if enabled else "success")
+                        if not fail:
+                            admission = next(v for k, v in writer.rows if k == "shadow_first_admission")
+                            self.assertEqual(admission["predicted_in_this_batch"], not enabled)
+                            self.assertEqual(admission["snapshot"], {
+                                "decision_batch_id": f"{row['instance_id']}:{row['schedule_id']}",
+                                "scheduled_timestamp": 123.0, "running_count": 1,
+                                "kv_usage": 0.0, "token_budget": 20})
+                        if enabled:
+                            self.assertEqual(row["candidate_ids"], tuple("abcd"))
+                            self.assertEqual((row["prediction_ns"], row["decision_ns"],
+                                              row["apply_ns"], row["restore_ns"]), (0, 0, 0, 0))
+                            self.assertEqual(row["prediction_successes"], 0)
+                            self.assertEqual((row["scores_p90"], row["sorted_ids"]), ((), ()))
+                            if not fail:
+                                head = obj.requests["a"]
+                                self.assertFalse(head.r1_shadow_predicted)
+                                obj.finish_requests("a", native.N["RequestStatus"].FINISHED_STOPPED)
+                                terminal = next(v for k, v in writer.rows if k == "shadow_terminal")
+                                self.assertTrue(terminal["was_admitted"])
+                                self.assertFalse(terminal["was_candidate"])
+                                self.assertEqual(terminal["status"], "FINISHED_STOPPED")
+                        self.assertEqual(outcomes[-1][3], [("a", 3)])
+                        self.assertEqual(outcomes[-1][4], ["a"])
+                        if fail:
+                            self.assertFalse(any(k == "shadow_first_admission" for k, _ in writer.rows))
+                self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_single_slot_does_not_change_every_phase(self):
+        obj, pred, writer = self.setup_scheduler(every=8, skip_single_slot=True)
+        obj.kv_cache_manager.fail.add("a")
+        obj.max_num_running_reqs = 1
+        obj.schedule()
+        self.assertEqual(self.event(writer)["reason"], "single_slot_skip")
+        obj.max_num_running_reqs = 2
+        for _ in range(16):
+            obj.schedule()
+        rows = [v for k, v in writer.rows if k == "r1_admission_v1"]
+        self.assertEqual([r["opportunity_id"] for r in rows if r["reason"] == "success"], [9, 17])
+        self.assertEqual([r["reason"] for r in rows[1:8]], ["interval_skip"] * 7)
+        self.assertTrue(all(r["checked"] == 0 for r in rows[1:8]))
+        self.assertEqual(pred.calls, 2)
+        self.assertEqual(obj.r1_admission.opportunities, 17)
+
+    def test_single_slot_multiple_slots_and_special_head(self):
+        obj, pred, writer = self.setup_scheduler(skip_single_slot=True)
+        obj.max_num_running_reqs = 2
+        obj.schedule()
+        self.assertEqual(pred.calls, 1)
+        self.assertEqual([r.request_id for r in obj.running], ["a", "c"])
+        self.assertEqual([r.request_id for r in obj.waiting], ["b", "d"])
+        self.assertEqual(self.event(writer)["available_running_slots"], 2)
+        obj, pred, writer = self.setup_scheduler(skip_single_slot=True)
+        obj.max_num_running_reqs = 1
+        special = obj.waiting[0]
+        special.status = native.N["RequestStatus"].WAITING_FOR_FSM
+        special.structured_output_request = None
+        obj.schedule()
+        self.assertEqual(pred.calls, 0)
+        self.assertEqual(self.event(writer)["reason"], "empty_prefix")
+        self.assertEqual([r.request_id for r in obj.running], ["b"])
+        self.assertEqual([r.request_id for r in obj.waiting], ["a", "c", "d"])
+        obj, pred, writer = self.setup_scheduler(skip_single_slot=True)
+        obj.max_num_running_reqs = 1
+        obj.waiting[1].status = native.N["RequestStatus"].WAITING_FOR_FSM
+        obj.waiting[1].structured_output_request = None
+        obj.schedule()
+        row = self.event(writer)
+        self.assertEqual((row["reason"], row["candidate_ids"], row["checked"]),
+                         ("single_slot_skip", ("a",), 2))
+        self.assertEqual(pred.calls, 0)
+        self.assertEqual([r.request_id for r in obj.waiting], ["b", "c", "d"])
+
+    def test_single_slot_snapshot_after_running_scheduling(self):
+        obj, predictor, writer = self.setup_scheduler(skip_single_slot=True)
+        running = req("running", native.N["RequestStatus"].RUNNING)
+        obj.running.append(running)
+        obj.requests[running.request_id] = running
+        obj.max_num_running_reqs = 2
+        with patch.object(native.time, "monotonic", return_value=456.0):
+            obj.schedule()
+        admission = next(v for k, v in writer.rows if k == "shadow_first_admission")
+        snapshot = admission["snapshot"]
+        self.assertEqual((snapshot["scheduled_timestamp"], snapshot["running_count"],
+                          snapshot["kv_usage"], snapshot["token_budget"]), (456.0, 1, .03, 17))
+        self.assertEqual(predictor.calls, 0)
+        self.assertEqual(obj.kv_cache_manager.allocations, [("running", 3), ("a", 3)])
+
+    def test_single_slot_invalid_snapshot_falls_back_without_prediction(self):
+        obj, predictor, writer = self.setup_scheduler(skip_single_slot=True)
+        obj.max_num_running_reqs = 1
+        obj.kv_cache_manager.allocated = 101  # usage is outside [0, 1]
+        obj.schedule()
+        self.assertEqual(self.event(writer)["reason"], "snapshot_failed")
+        self.assertEqual(predictor.calls, 0)
+        admission = next(v for k, v in writer.rows if k == "shadow_first_admission")
+        self.assertIsNone(admission["snapshot"])
+        self.assertFalse(admission["predicted_in_this_batch"])
+
+    def test_single_slot_real_writer_keeps_snapshot_terminal_and_footer(self):
+        with tempfile.TemporaryDirectory(prefix="r1-single-slot-", dir=native.ROOT) as tmp:
+            path = Path(tmp)
+            writer = native.C.RecordWriter(native.C.CollectionConfig("single-slot", path), "shadow-core")
+            obj, predictor, _ = self.setup_scheduler(skip_single_slot=True)
+            shadow = S.Shadow(S.ShadowConfig(path / "unused", "single-slot", path), predictor, writer)
+            obj.r1_shadow = shadow
+            obj.r1_admission = A.AdmissionController(A.AdmissionConfig("apply", 1, 32, True),
+                                                     shadow, S.valid_lengths)
+            obj.max_num_running_reqs = 1
+            obj.schedule()
+            obj.finish_requests("a", native.N["RequestStatus"].FINISHED_STOPPED)
+            self.assertTrue(shadow.close())
+            rows = [json.loads(line) for line in writer.path.read_text("utf-8").splitlines()]
+            event = next(r for r in rows if r["record_type"] == "r1_admission_v1")
+            admission = next(r for r in rows if r["record_type"] == "shadow_first_admission")
+            terminal = next(r for r in rows if r["record_type"] == "shadow_terminal")
+            self.assertEqual(event["reason"], "single_slot_skip")
+            self.assertEqual(admission["snapshot"]["running_count"], 0)
+            self.assertFalse(admission["predicted_in_this_batch"])
+            self.assertTrue(terminal["was_admitted"])
+            self.assertFalse(terminal["was_candidate"])
+            self.assertTrue(rows[-1]["clean_shutdown"])
+            self.assertTrue(rows[-1]["records_complete"])
+
+    def test_single_slot_config_and_off_mode(self):
+        for value, expected in ((None, False), ("0", False), ("1", True)):
+            env = {} if value is None else {"VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": value}
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(A.AdmissionConfig.from_env().skip_single_slot, expected)
+        for invalid in ("", "true", "2", "-1"):
+            with patch.dict(os.environ, {"VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": invalid}, clear=True):
+                with self.assertRaisesRegex(ValueError, "SKIP_SINGLE_SLOT"):
+                    A.AdmissionConfig.from_env()
+        obj, pred, writer = self.setup_scheduler(mode="off", skip_single_slot=True)
+        obj.max_num_running_reqs = 1
+        obj.schedule()
+        self.assertEqual(pred.calls, 1)  # Old shadow sweep, unaffected by RC1 flag.
+        self.assertFalse(any(k == "r1_admission_v1" for k, _ in writer.rows))
 
     def test_opportunity_frequency_empty_failure_and_no_stale(self):
         obj, pred, writer = self.setup_scheduler(names="a", every=8)
@@ -330,6 +502,13 @@ class AdmissionTests(unittest.TestCase):
             with patch.dict(os.environ, {"VLLM_R1_ADMISSION_MODE": "invalid"}, clear=True):
                 with self.assertRaises(ValueError):
                     ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
+            with patch.dict(os.environ, {"VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "invalid"}, clear=True):
+                with self.assertRaisesRegex(ValueError, "SKIP_SINGLE_SLOT"):
+                    ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
+            with patch.dict(os.environ, {"VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT": "1"}, clear=True):
+                obj = ns["Scheduler"](cfg, types.SimpleNamespace(), types.SimpleNamespace())
+                self.assertEqual(obj.r1_admission_mode, "off")
+                self.assertIsNone(obj.r1_admission)
 
     def test_timing_and_outcome_records_are_separate(self):
         obj, _, writer = self.setup_scheduler()
