@@ -15,6 +15,7 @@ class AdmissionConfig:
     prefix_limit: int
     skip_single_slot: bool = False
     head_policy: str = "protected"
+    time_observation: bool = False
 
     def __post_init__(self):
         if self.head_policy not in ("protected", "ranked"):
@@ -38,7 +39,10 @@ class AdmissionConfig:
         if skip not in ("0", "1"):
             raise ValueError("VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT must be 0 or 1")
         head_policy = os.environ.get("VLLM_R1_ADMISSION_HEAD_POLICY", "protected")
-        return cls(mode, every, limit, skip == "1", head_policy)
+        timing = os.environ.get("VLLM_R1_ADMISSION_TIME_OBSERVE", "0")
+        if timing not in ("0", "1"):
+            raise ValueError("VLLM_R1_ADMISSION_TIME_OBSERVE must be 0 or 1")
+        return cls(mode, every, limit, skip == "1", head_policy, timing == "1")
 
 
 def unsupported_reason(config):
@@ -117,6 +121,24 @@ class AdmissionController:
                 and r.lora_request is None and not r.use_structured_output
                 and r.kv_transfer_params is None)
 
+    def observe_schedule_time(self, frame, timestamp):
+        start = time.perf_counter_ns()
+        frame["scheduled_timestamp"] = timestamp
+        frame["head_queued_timestamp"] = None
+        frame["head_queued_status"] = "not_scanned"
+        frame["time_observation_ns"] = time.perf_counter_ns() - start
+
+    def observe_head_time(self, frame, request, log_stats):
+        start = time.perf_counter_ns()
+        value = getattr(request, "r1_first_queued_timestamp", None)
+        frame["head_queued_timestamp"] = value
+        frame["head_queued_status"] = ("available" if value is not None else
+                                       "log_stats_disabled" if not log_stats else
+                                       "queued_event_unavailable")
+        elapsed = time.perf_counter_ns() - start
+        frame["time_observation_ns"] += elapsed
+        return elapsed
+
     def make_decision(self, frame, candidates, running_count, kv_usage):
         matrix = self.shadow.predictor.assemble(candidates, running_count, kv_usage)
         values = self.shadow.predictor.dynamic(matrix)
@@ -163,6 +185,13 @@ class AdmissionController:
                                     and frame["waiting_size"] > frame["checked"] else "end")
         frame["candidate_count"] = len(candidates)
         frame["trigger_prefix_ns"] = time.perf_counter_ns() - start
+        head_observation_ns = 0
+        if candidates and self.config.time_observation:
+            head_observation_ns = self.observe_head_time(frame, candidates[0], scheduler.log_stats)
+        elif self.config.time_observation:
+            observation_start = time.perf_counter_ns()
+            frame["head_queued_status"] = "no_eligible_head"
+            frame["time_observation_ns"] += time.perf_counter_ns() - observation_start
         if not candidates:
             frame["reason"] = "empty_prefix"
             return None
@@ -184,10 +213,10 @@ class AdmissionController:
             except Exception as exc:
                 frame["reason"] = "snapshot_failed"
                 frame["error_type"] = type(exc).__name__
-                frame["trigger_prefix_ns"] = time.perf_counter_ns() - start
+                frame["trigger_prefix_ns"] = time.perf_counter_ns() - start - head_observation_ns
                 return None
             frame["reason"] = "single_slot_skip"
-            frame["trigger_prefix_ns"] = time.perf_counter_ns() - start
+            frame["trigger_prefix_ns"] = time.perf_counter_ns() - start - head_observation_ns
             return snapshot, ()
         started = time.perf_counter_ns()
         try:

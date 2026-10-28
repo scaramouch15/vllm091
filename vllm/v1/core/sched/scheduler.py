@@ -184,7 +184,8 @@ class Scheduler(SchedulerInterface):
                 "VLLM_R1_ADMISSION_EVERY" in os.environ or
                 "VLLM_R1_ADMISSION_PREFIX_LIMIT" in os.environ or
                 "VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT" in os.environ or
-                "VLLM_R1_ADMISSION_HEAD_POLICY" in os.environ):
+                "VLLM_R1_ADMISSION_HEAD_POLICY" in os.environ or
+                "VLLM_R1_ADMISSION_TIME_OBSERVE" in os.environ):
             from vllm.v1.core.sched.r1_admission import AdmissionConfig
             admission_config = AdmissionConfig.from_env()
         self.r1_shadow = None
@@ -250,6 +251,8 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        if admission_frame is not None and self.r1_admission.config.time_observation:
+            self.r1_admission.observe_schedule_time(admission_frame, scheduled_timestamp)
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -978,6 +981,9 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
+            if (getattr(self, "r1_admission", None) is not None and
+                    self.r1_admission.config.time_observation):
+                request.r1_first_queued_timestamp = request.events[-1].timestamp
 
     def finish_requests(
         self,

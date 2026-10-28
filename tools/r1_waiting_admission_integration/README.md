@@ -10,6 +10,7 @@
 | `VLLM_R1_ADMISSION_EVERY` | 正整数，默认 8。策略机会 1、9、17… 更新，其余机会不提取候选，不预测。|
 | `VLLM_R1_ADMISSION_PREFIX_LIMIT` | 1–4096，默认 32；最多检查该数位置，遇首个不合格对象截断，不读取 P+1。|
 | `VLLM_R1_ADMISSION_HEAD_POLICY` | `protected`（默认）或 `ranked`，非法值启动失败。protected 固定候选队首，其余按 P90 稳定升序；ranked 对整个候选窗口按 P90 稳定升序，同分均保留原位置。|
+| `VLLM_R1_ADMISSION_TIME_OBSERVE` | `0`（默认）或 `1`；仅在 admission observe/apply 且 shadow 可用时记录队首原生时间，不启动 collector。非法值启动失败。|
 | `VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT` | `0`（默认）或 `1`，非法值启动报错。仅在 observe/apply 的抽样更新机会启用；`1` 时合格前缀非空且 waiting 准入前只有一个空闲 running 名额，跳过动态组装、推理、排序和窗口应用/恢复。|
 
 上述参数均在 Scheduler 初始化时解析，不支持热更新；非法数值启动失败。observe/apply 需要原有 `VLLM_R1_SHADOW=1`、shadow 的模型路径、run ID、目录及其已有 Python/依赖/线程门禁，以复用前端静态长度、Core 动态模型和 writer。shadow 关闭时打印 `shadow_disabled` 并原生回退，不自动启用预测。off 与 shadow 开/关的旧组合继续按原路径运行，新增一次 Python 调用包装及配置判断，不能声称零开销。新模式启用时不执行旧 `shadow.sweep` 或旧 P90 排序，即使旧 `VLLM_R1_SHADOW_SORT=1`；不会再次批量预测。旧 shadow 的频率、128 扫描上限和跳过无效候选逻辑只在 off 模式保留。8/32 只是首轮值；旧 8/128/32 不是最终参数。
@@ -33,6 +34,14 @@ apply 的 protected 模式固定候选队首；ranked 模式将队首纳入整�
 请求新增/取消的串行假设及特殊状态分析见 `tools/r1_waiting_admission_design/DESIGN.md`；其他 Scheduler、并发重入和真实 KV/connector 环境未经验证。首次准入标志由已有 shadow 的 Request 生命周期跟踪；不应把 score 或决策跨轮复用。
 
 ## 记录与计时
+
+开启时间观测且 `log_stats` 开启时，Scheduler.add_request 在原生 QUEUED 事件创建后复制同一事件的 timestamp 到 Request，不消费事件；`take_events()` 后仍可使用，排序和 skipped 回填不重置。`head_queued_timestamp` 是候选队首首次入队的原生 monotonic 时间，缺失时为 null，`head_queued_status` 为 `log_stats_disabled`、`queued_event_unavailable`、`not_scanned` 或 `no_eligible_head`；`scheduled_timestamp` 是本轮原生调度入口 monotonic 采样时间，不是出队或排序完成时间。默认 arrival_time 使用 time.time，与其不可直接相减；按原生事件契约不可假定不同进程时钟可直接比较。
+
+`time_observation_ns` 单列轮次时间和队首时间字段准备的测量；原 prediction/decision/apply/restore 范围未变，单名额路径原 trigger 区间扣除队首时间字段测量。计时指令、函数调用及入队时保存字段的增量不完全计入该值；调度期间的观测包含在 `admission_schedule_foreground_v1`，日志字典复制和入队包含在既有 `admission_log_foreground_v1`。后台序列化和写盘另计。关闭时无新增时间字段或逐请求记录。
+
+脱敏示例：`r1_admission_v1` 中 `candidate_ids=[A,B]`、`window_admitted=[B]`、`head_queued_timestamp=100.0`、`scheduled_timestamp=105.0` 表示观察到实际让位；后续相同引擎请求 ID A 的 `shadow_first_admission.snapshot.decision_batch_id` 关联其准入决策。完成统计在前端 `OutputProcessor.process_outputs` 的原生 `RequestStateStats`/`FinishedRequestStats` 中，已有 `request_collector` 可在另行配置开启时导出 `finished` 的 queued/scheduled/first_token/last_token、inference_time 和 finish_reason；本开关不启用该采集。`shadow_terminal.status` 可区分结束状态，但其日志时间不是 last_token_ts。取消、异常或日志缺失不保证有完整 finished 行；按 ID、run 和完整性记录关联，不以 0 或日志时间填补缺失。两类 writer/进程的时间域及请求 ID 对应关系须验证，不能凭字段名假设可跨进程相减。
+
+这些记录描述实际轨迹，不能单独证明当时保护一定达标，也不能把让位后的全部等待当成一次让位的因果代价。原生完成统计的自动导出需要另行启用历史 collector 及其请求身份约束；不扩大本次修改范围。
 
 每个启用且受支持的 schedule 完成时经现有异步 writer 生成 `r1_admission_v1`。记录 mode、规则、every/prefix_limit、实例、schedule 和机会 ID、waiting_size、checked、prefix_stop、candidate_count、候选和排序 ID、P90 分数、是否变序和实际应用、窗口 `window_A/window_M` 与尝试/准入 ID、尾部 `tail_A/tail_M` 和准入 ID、`actual_admission_order`、reason、exit_reason、预测成功总数、running/KV 快照和 token budget。尾部尝试只保留数量，避免在大量原生 skip 时为日志建立随 waiting 长度增长的 ID 列表。日志不包含 prompt 或 Request 引用，writer 丢失由既有 summary/footer 完整性字段报告。
 
