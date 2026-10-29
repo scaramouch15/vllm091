@@ -9,13 +9,16 @@
 | `VLLM_R1_ADMISSION_MODE` | `off`（默认）、`observe`、`apply`，其他值启动失败。off 保留原生及既有 shadow sweep。observe 计算决策但不改 waiting；apply 使用同一逻辑改变本轮窗口尝试次序。|
 | `VLLM_R1_ADMISSION_EVERY` | 正整数，默认 8。策略机会 1、9、17… 更新，其余机会不提取候选，不预测。|
 | `VLLM_R1_ADMISSION_PREFIX_LIMIT` | 1–4096，默认 32；最多检查该数位置，遇首个不合格对象截断，不读取 P+1。|
-| `VLLM_R1_ADMISSION_HEAD_POLICY` | `protected`（默认）或 `ranked`，非法值启动失败。protected 固定候选队首，其余按 P90 稳定升序；ranked 对整个候选窗口按 P90 稳定升序，同分均保留原位置。|
+| `VLLM_R1_ADMISSION_HEAD_POLICY` | `protected`（默认）、`ranked` 或下列两种条件模式，非法值启动失败。protected 固定候选队首，其余按 P90 稳定升序；ranked 对整个候选窗口按 P90 稳定升序，同分均保留原位置。|
+| `VLLM_R1_ADMISSION_HEAD_POLICY` 条件模式 | `conditional_wait` 或 `conditional_risk`；observe/apply 要求 `TIME_OBSERVE=1`、原生 `log_stats` 开启及 `SKIP_SINGLE_SLOT=0`。|
+| `VLLM_R1_ADMISSION_WAIT_LIMIT_SECONDS` | 条件模式必须显式配置有限正秒数，无默认值。|
+| `VLLM_R1_ADMISSION_BUDGET_SECONDS` | `conditional_risk` 必填，有限正秒数且大于 WAIT_LIMIT；入队至末 token 的引擎预算，不是客户端 E2EL SLO。|
 | `VLLM_R1_ADMISSION_TIME_OBSERVE` | `0`（默认）或 `1`；仅在 admission observe/apply 且 shadow 可用时记录队首原生时间，不启动 collector。非法值启动失败。|
 | `VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT` | `0`（默认）或 `1`，非法值启动报错。仅在 observe/apply 的抽样更新机会启用；`1` 时合格前缀非空且 waiting 准入前只有一个空闲 running 名额，跳过动态组装、推理、排序和窗口应用/恢复。|
 
 上述参数均在 Scheduler 初始化时解析，不支持热更新；非法数值启动失败。observe/apply 需要原有 `VLLM_R1_SHADOW=1`、shadow 的模型路径、run ID、目录及其已有 Python/依赖/线程门禁，以复用前端静态长度、Core 动态模型和 writer。shadow 关闭时打印 `shadow_disabled` 并原生回退，不自动启用预测。off 与 shadow 开/关的旧组合继续按原路径运行，新增一次 Python 调用包装及配置判断，不能声称零开销。新模式启用时不执行旧 `shadow.sweep` 或旧 P90 排序，即使旧 `VLLM_R1_SHADOW_SORT=1`；不会再次批量预测。旧 shadow 的频率、128 扫描上限和跳过无效候选逻辑只在 off 模式保留。8/32 只是首轮值；旧 8/128/32 不是最终参数。
 
-`observe`/`apply` 下 `HEAD_POLICY=ranked` 与 `SKIP_SINGLE_SLOT=1` 冲突并在启动时明确报错：ranked 的单名额也可能需要比较候选。`protected` 保留现有单名额跳过行为。admission `off` 不启用研究排序，可解析上述组合但不触发策略。后续 protected/ranked 对照拟统一采用 `EVERY=1`、`PREFIX_LIMIT=32`、`SKIP_SINGLE_SLOT=0`；这是实验配置，并非适用于所有负载的最终参数。
+`observe`/`apply` 下 `HEAD_POLICY=ranked` 或条件模式与 `SKIP_SINGLE_SLOT=1` 冲突并在启动时明确报错：单名额也可能需要比较候选。`protected` 保留现有单名额跳过行为。admission `off` 不启用研究排序，可解析上述组合但不触发策略。后续 protected/ranked 对照拟统一采用 `EVERY=1`、`PREFIX_LIMIT=32`、`SKIP_SINGLE_SLOT=0`；这是实验配置，并非适用于所有负载的最终参数。
 
 支持范围由 `r1_admission.unsupported_reason` 根据真实配置字段检查：原生 V1 FCFS Scheduler、普通文本 decoder、DP=PP=TP=1，无 KV connector、speculative、LoRA 配置；并沿用现有 B 工件验证所需的 Meta-Llama-3-8B-Instruct 模型/tokenizer、Llama 架构及不 lower-case 条件。不支持时前端和 Core 的 shadow 加载均回退，记录可辨识启动警告，继续原生。该检查位于内置 Scheduler 和现有 shadow 创建路径；如果配置了其他 Scheduler 且 shadow 关闭，那个外部 Scheduler 不运行本代码，因此本模块无法为其提供独立启动警告。已启用 shadow 的模型工件哈希、Python/包版本及线程检查仍执行，错误会按已有 shadow 行为报错，不作为配置回退。
 
@@ -65,3 +68,13 @@ python -B tools/r1_selection_microbench/test_selection.py -v
 集成测试从实际 `scheduler.py` 抽取执行 Scheduler 类，使用可控 Request、KV、预测器和 writer 替身；它执行真实 `schedule` 方法，但不是完整 vLLM 导入或真实 GPU 服务。独立状态模型不证明生产资源和并发安全。未进行服务端 CPU 或 GPU 实验，不能据此声称 E2EL 收益、公平性保证或大负载开销可控。
 
 这是队首策略消融，不是完整公平性策略；ranked 暂无新增等待时间上界或防饥饿保证，120 请求有限实验不能证明长期公平性。先完成只读审查，再由用户手动运行实验；目前不宣称 E2EL、吞吐或 SLO 收益。
+
+## 条件队首保护
+
+仅当本轮有效 ranked 顺序将原队首移后时计算：`W=scheduled_timestamp-head_queued_timestamp`。conditional_wait 在 `W >= WAIT_LIMIT` 时保护；conditional_risk 在等待条件或 `BUDGET-W <= 原队首P90` 时保护，两条件独立计算。已超预算仍参与同一规则，不丢弃或永久降级，不称作 SLO 挽救。保护时仅将已排序索引中的队首移至第一，其余相对顺序不变；没有第二次排序。missing、非有限或晚于轮次的 queued 时间按 protected 回退并记录原因；预测失败、间隔跳过和身份失败仍走原生回退。observe 只记录计划，apply 才应用。队首原本第一时条件不计算。
+
+scheduled_timestamp 在 running 调度之前采样；W 不含本轮 running、预测或排序时间。两个时间由同一 Core 进程的原生 monotonic 调用链产生；数值比较本身不能证明时钟来源一致。WAIT_LIMIT 和 BUDGET 均为实验配置，本实现不提供推荐值；条件策略不保证等待上界、长期公平性或收益。
+
+条件记录含 `conditional_policy`、`ranked_head_displaced`、`ranked_head_position`、`wait_seconds`、配置的 `wait_limit_seconds` 和 `budget_seconds`、`wait_due`、`risk_due`、`selected_policy`、`condition_fallback`。未评估时为 null；`sorted_ids` 为最终计划顺序，实际结果仍查 `window_admitted` / `actual_admission_order`。`condition_check_ns` 包含索引位置定位、条件计算和选择，`head_adjust_ns` 包含移位与最终顺序记录，二者互不重叠。条件模式的 `decision_ns` 测量原有身份校验和 ranked 排序及初始结果构造，条件工作单列；新增计时开销仍包含在 `admission_schedule_foreground_v1`，日志入队计入原有 `admission_log_foreground_v1`。不能相加分位数或将内部区间加到外围总耗时。
+
+`ranked_head_position` 使用从 0 开始的索引；条件模式的 `score_rule=all_p90_ascending_stable_v1` 描述初始 ranked 排序，最终选择查看 `selected_policy` 和 `sorted_ids`。条件关闭时不添加条件记录字段。引擎间结果必须依赖已验证的时钟与请求身份契约，不能仅凭浮点数比较判断时钟来源。

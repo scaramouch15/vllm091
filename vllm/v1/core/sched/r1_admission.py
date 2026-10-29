@@ -16,12 +16,24 @@ class AdmissionConfig:
     skip_single_slot: bool = False
     head_policy: str = "protected"
     time_observation: bool = False
+    wait_limit_seconds: float = None
+    budget_seconds: float = None
 
     def __post_init__(self):
-        if self.head_policy not in ("protected", "ranked"):
-            raise ValueError("VLLM_R1_ADMISSION_HEAD_POLICY must be protected or ranked")
-        if self.mode in ("observe", "apply") and self.head_policy == "ranked" and self.skip_single_slot:
-            raise ValueError("ranked head policy conflicts with VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT=1 in observe/apply")
+        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk"):
+            raise ValueError("invalid VLLM_R1_ADMISSION_HEAD_POLICY")
+        if self.mode in ("observe", "apply") and self.head_policy != "protected" and self.skip_single_slot:
+            raise ValueError("ranked or conditional head policy conflicts with SKIP_SINGLE_SLOT=1")
+        if self.mode in ("observe", "apply") and self.head_policy.startswith("conditional_"):
+            if not self.time_observation:
+                raise ValueError("conditional head policy requires TIME_OBSERVE=1")
+            if (self.wait_limit_seconds is None or not math.isfinite(self.wait_limit_seconds)
+                    or self.wait_limit_seconds <= 0):
+                raise ValueError("conditional head policy requires finite WAIT_LIMIT_SECONDS > 0")
+            if self.head_policy == "conditional_risk" and (
+                    self.budget_seconds is None or not math.isfinite(self.budget_seconds)
+                    or self.budget_seconds <= self.wait_limit_seconds):
+                raise ValueError("conditional_risk requires finite BUDGET_SECONDS > WAIT_LIMIT_SECONDS > 0")
 
     @classmethod
     def from_env(cls):
@@ -42,7 +54,15 @@ class AdmissionConfig:
         timing = os.environ.get("VLLM_R1_ADMISSION_TIME_OBSERVE", "0")
         if timing not in ("0", "1"):
             raise ValueError("VLLM_R1_ADMISSION_TIME_OBSERVE must be 0 or 1")
-        return cls(mode, every, limit, skip == "1", head_policy, timing == "1")
+        wait = budget = None
+        if mode in ("observe", "apply") and head_policy in ("conditional_wait", "conditional_risk"):
+            try:
+                wait = float(os.environ["VLLM_R1_ADMISSION_WAIT_LIMIT_SECONDS"])
+                if head_policy == "conditional_risk":
+                    budget = float(os.environ["VLLM_R1_ADMISSION_BUDGET_SECONDS"])
+            except (KeyError, ValueError) as exc:
+                raise ValueError("conditional policy requires explicit numeric WAIT_LIMIT_SECONDS and, for risk, BUDGET_SECONDS") from exc
+        return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget)
 
 
 def unsupported_reason(config):
@@ -91,7 +111,7 @@ class AdmissionController:
 
     def begin(self):
         self.schedules += 1
-        return {"schema_version": 1, "mode": self.config.mode,
+        frame = {"schema_version": 1, "mode": self.config.mode,
                 "every": self.config.every, "prefix_limit": self.config.prefix_limit,
                 "skip_single_slot": self.config.skip_single_slot,
                 "head_policy": self.config.head_policy,
@@ -111,6 +131,14 @@ class AdmissionController:
                 "trigger_prefix_ns": 0, "prediction_ns": 0,
                 "decision_ns": 0, "apply_ns": 0, "restore_ns": 0,
                 "_candidates": (), "_candidate_set": frozenset(), "_applied": False}
+        if self.config.head_policy in ("conditional_wait", "conditional_risk"):
+            frame.update(conditional_policy=self.config.head_policy, ranked_head_displaced=None,
+                         ranked_head_position=None, wait_seconds=None,
+                         wait_limit_seconds=self.config.wait_limit_seconds,
+                         budget_seconds=self.config.budget_seconds, wait_due=None,
+                         risk_due=None, selected_policy=None, condition_fallback=None,
+                         condition_check_ns=0, head_adjust_ns=0, condition_timing_version=1)
+        return frame
 
     def eligible(self, r):
         # Missing optional admitted flag is rejected, never defaulted to eligible.
@@ -259,6 +287,43 @@ class AdmissionController:
             frame["error_type"] = type(exc).__name__
             return None
         frame["decision_ns"] = time.perf_counter_ns() - started
+        if self.config.head_policy in ("conditional_wait", "conditional_risk"):
+            check_start = time.perf_counter_ns()
+            head_position = order.index(0)
+            frame["ranked_head_position"] = head_position
+            frame["ranked_head_displaced"] = head_position != 0
+            selected = "ranked"
+            if head_position:
+                queued = frame.get("head_queued_timestamp")
+                if queued is None:
+                    frame["condition_fallback"] = "queued_timestamp_missing"
+                elif (isinstance(queued, bool) or not isinstance(queued, (int, float))
+                      or not math.isfinite(queued)):
+                    frame["condition_fallback"] = "queued_timestamp_invalid"
+                    frame["head_queued_timestamp"] = None
+                    frame["head_queued_status"] = "queued_timestamp_invalid"
+                elif queued > timestamp:
+                    frame["condition_fallback"] = "queued_timestamp_after_schedule"
+                else:
+                    age = timestamp - queued
+                    frame["wait_seconds"] = age
+                    frame["wait_due"] = age >= self.config.wait_limit_seconds
+                    if self.config.head_policy == "conditional_risk":
+                        frame["risk_due"] = self.config.budget_seconds - age <= decision.scores[0]
+                    if frame["wait_due"] or frame["risk_due"]:
+                        selected = "protected"
+                if frame["condition_fallback"] is not None:
+                    selected = "protected"
+            frame["selected_policy"] = selected
+            frame["condition_check_ns"] = time.perf_counter_ns() - check_start
+            if selected == "protected":
+                adjust_start = time.perf_counter_ns()
+                order.pop(head_position)
+                order.insert(0, 0)
+                ordered = tuple(candidates[i] for i in order)
+                frame["sorted_ids"] = tuple(r.request_id for r in ordered)
+                frame["order_changed"] = frame["sorted_ids"] != ids
+                frame["head_adjust_ns"] = time.perf_counter_ns() - adjust_start
         for r in candidates:
             r.r1_shadow_predicted = True
         frame["reason"] = "success"

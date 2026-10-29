@@ -188,6 +188,9 @@ class Scheduler(SchedulerInterface):
                 "VLLM_R1_ADMISSION_TIME_OBSERVE" in os.environ):
             from vllm.v1.core.sched.r1_admission import AdmissionConfig
             admission_config = AdmissionConfig.from_env()
+            if (admission_config.mode in ("observe", "apply") and
+                    admission_config.head_policy.startswith("conditional_") and not self.log_stats):
+                raise ValueError("conditional head policy requires native log_stats")
         self.r1_shadow = None
         if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
             from vllm.v1.metrics.r1_shadow import create_shadow
