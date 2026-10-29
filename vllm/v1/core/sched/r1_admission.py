@@ -137,7 +137,7 @@ class AdmissionController:
                          wait_limit_seconds=self.config.wait_limit_seconds,
                          budget_seconds=self.config.budget_seconds, wait_due=None,
                          risk_due=None, selected_policy=None, condition_fallback=None,
-                         condition_check_ns=0, head_adjust_ns=0, condition_timing_version=1)
+                         condition_check_ns=0, head_adjust_ns=0, condition_timing_version=2)
         return frame
 
     def eligible(self, r):
@@ -289,11 +289,12 @@ class AdmissionController:
         frame["decision_ns"] = time.perf_counter_ns() - started
         if self.config.head_policy in ("conditional_wait", "conditional_risk"):
             check_start = time.perf_counter_ns()
-            head_position = order.index(0)
-            frame["ranked_head_position"] = head_position
-            frame["ranked_head_displaced"] = head_position != 0
+            displaced = order[0] != 0
+            frame["ranked_head_displaced"] = displaced
+            if not displaced:
+                frame["ranked_head_position"] = 0
             selected = "ranked"
-            if head_position:
+            if displaced:
                 queued = frame.get("head_queued_timestamp")
                 if queued is None:
                     frame["condition_fallback"] = "queued_timestamp_missing"
@@ -318,6 +319,8 @@ class AdmissionController:
             frame["condition_check_ns"] = time.perf_counter_ns() - check_start
             if selected == "protected":
                 adjust_start = time.perf_counter_ns()
+                head_position = order.index(0)
+                frame["ranked_head_position"] = head_position
                 order.pop(head_position)
                 order.insert(0, 0)
                 ordered = tuple(candidates[i] for i in order)

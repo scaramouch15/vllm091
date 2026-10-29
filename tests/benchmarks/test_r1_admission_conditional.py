@@ -82,7 +82,41 @@ class ConditionalTests(base.AdmissionTests):
             self.assertEqual(row["sorted_ids"], ("a", "c", "d", "b"))
             self.assertEqual(row["actual_admission_order"], ["a", "c"] if mode == "apply" else ["a", "b"])
             self.assertEqual([r.request_id for r in obj.waiting], ["b", "d"] if mode == "apply" else ["c", "d"])
-            self.assertEqual(row["condition_timing_version"], 1)
+            self.assertEqual(row["condition_timing_version"], 2)
+
+    def test_risk_all_boolean_combinations_and_no_unneeded_search(self):
+        class NoIndexList(list):
+            def index(self, *args):
+                raise AssertionError("unexpected head search")
+        # Synthetic thresholds and scores only, not recommended experiment parameters.
+        for wait_due, risk_due, stamp, score in (
+                (True, False, 95., 1.), (False, False, 99., 1.),
+                (False, True, 96., 6.), (True, True, 95., 6.)):
+            for mode in ("observe", "apply"):
+                with self.subTest(wait_due=wait_due, risk_due=risk_due, mode=mode):
+                    obj, pred, writer = self.configured(policy="conditional_risk", mode=mode, stamp=stamp)
+                    pred.scores = {"a": score, "b": .1, "c": .2, "d": .3}
+                    searches_forbidden = not (wait_due or risk_due)
+                    calls = []
+                    def counted(values, *args, **kwargs):
+                        result = builtins.sorted(values, *args, **kwargs)
+                        if isinstance(values, range):
+                            calls.append(1)
+                            if searches_forbidden:
+                                return NoIndexList(result)
+                        return result
+                    with patch.object(base.A, "sorted", side_effect=counted, create=True):
+                        self.run_at_100(obj)
+                    row = self.event(writer)
+                    protected = wait_due or risk_due
+                    self.assertEqual((row["wait_due"], row["risk_due"]), (wait_due, risk_due))
+                    self.assertEqual(row["selected_policy"], "protected" if protected else "ranked")
+                    self.assertTrue(row["ranked_head_displaced"])
+                    self.assertEqual(row["ranked_head_position"], 3 if protected else None)
+                    self.assertEqual(row["sorted_ids"][0], "a" if protected else "b")
+                    self.assertEqual(row["actual_admission_order"], ["a" if mode == "observe" or protected else "b"])
+                    self.assertEqual((pred.calls, len(calls)), (1, 1))
+                    self.assertEqual(row["condition_timing_version"], 2)
 
     def test_failure_and_frequency_native_fallback(self):
         obj, pred, writer = self.configured()
