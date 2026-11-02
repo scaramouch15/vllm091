@@ -74,6 +74,7 @@ from benchmark_dataset import (
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from mixed_workload_dataset import add_mixed_dataset_args, mixed_dataset_from_args
+from r1_goodput_by_type import check_type_args, evaluate, write_evaluation
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -292,11 +293,26 @@ async def benchmark(
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
     request_collector: Optional[Any] = None,
+    type_slos: Optional[dict] = None,
+    type_output: Optional[str] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
+
+    if type_slos is not None:
+        indices = []
+        for request in input_requests:
+            metadata = getattr(request, "metadata", {})
+            index, kind = metadata.get("request_index"), metadata.get("task_type")
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0 or kind not in ("chat", "code", "summary"):
+                raise ValueError("type goodput requires a valid mixed request identity and type")
+            indices.append(index)
+        if len(set(indices)) != len(indices):
+            raise ValueError("type goodput requires unique request indices")
+        if os.path.exists(type_output):
+            raise FileExistsError(type_output)
 
     collection_contexts = None
     if request_collector is not None:
@@ -373,14 +389,20 @@ async def benchmark(
     #                 if max_concurrency else contextlib.nullcontext())
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
-    async def limited_request_func(request_func_input, pbar):
+    formal_attempts = []
+    async def limited_request_func(request_func_input, pbar, identity):
+        async def send():
+            if identity is not None:
+                formal_attempts.append(identity)
+            return await request_func(request_func_input=request_func_input, pbar=pbar)
         if semaphore is None:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await send()
         async with semaphore:
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+            return await send()
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    task_ids = []
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len, mm_content = (
             request.prompt,
@@ -407,9 +429,18 @@ async def benchmark(
         )
         if collection_contexts is not None:
             request_func_input.collection_context = collection_contexts[id(request)]
+        identity = None
+        if type_slos is not None:
+            metadata = getattr(request, "metadata", {})
+            index = metadata.get("request_index")
+            task_type = metadata.get("task_type")
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0 or task_type not in ("chat", "code", "summary"):
+                raise ValueError("type goodput requires mixed request index and type")
+            identity = {"request_id": str(index), "task_type": task_type, "phase": "formal"}
+        task_ids.append(identity["request_id"] if identity else None)
         tasks.append(
             asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input, pbar=pbar)
+                limited_request_func(request_func_input=request_func_input, pbar=pbar, identity=identity)
             )
         )
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
@@ -442,6 +473,18 @@ async def benchmark(
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
     )
+
+    type_summary = None
+    if type_slos is not None:
+        type_results = {}
+        for rid, output, output_len in zip(task_ids, outputs, actual_output_lens):
+            type_results[rid] = {"success": output.success, "latency_s": output.latency,
+                                 "ttft_s": output.ttft, "output_tokens": output_len}
+        type_summary = evaluate(type_slos, formal_attempts, type_results, benchmark_duration)
+        write_evaluation(type_output, type_slos, formal_attempts, type_results,
+                         benchmark_duration, type_summary)
+        for name, values in [*type_summary["types"].items(), ("overall", type_summary["overall"])]:
+            print(f"Type goodput {name}: {values}")
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
@@ -486,6 +529,9 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+
+    if type_summary is not None:
+        result["goodput_by_type"] = type_summary
 
     def process_one_metric(
         # E.g., "ttft"
@@ -611,6 +657,8 @@ def save_to_pytorch_benchmark_format(
 
 def main(args: argparse.Namespace):
     print(args)
+    type_slos = check_type_args(args.goodput, getattr(args, "goodput_by_type", None),
+                                args.dataset_name, getattr(args, "goodput_by_type_output", None))
     if getattr(args, "mixed_dry_run", False) and args.dataset_name != "mixed":
         raise ValueError("--mixed-dry-run requires --dataset-name mixed")
     mixed_dataset = (
@@ -878,6 +926,8 @@ def main(args: argparse.Namespace):
                 lora_modules=args.lora_modules,
                 extra_body=sampling_params,
                 request_collector=request_collector,
+                type_slos=type_slos,
+                type_output=args.goodput_by_type_output,
             )
         )
     finally:
@@ -1151,6 +1201,11 @@ if __name__ == "__main__":
         "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve",
     )
+
+    parser.add_argument("--goodput-by-type", nargs="+", default=None,
+                        help="Mixed-request per-type SLOs in milliseconds; evaluation only, not scheduler configuration.")
+    parser.add_argument("--goodput-by-type-output", default=None,
+                        help="New JSON file for per-request evaluation and offline recalculation.")
 
     # group for dataset specific arguments
     custom_group = parser.add_argument_group("custom dataset options")

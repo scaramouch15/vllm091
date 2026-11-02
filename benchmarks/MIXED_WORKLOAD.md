@@ -117,3 +117,30 @@ python benchmarks/benchmark_serving.py \
 最终 diff：`benchmark_serving.py` 增加 36 行、删除 2 行；新增一个数据集模块、一个测试文件和本说明。原生类、发送器、引擎、另一套 benchmark、环境与锁文件均保持原样，用户的 AGENTS.md 不计入本次改动。下一步需要在已有完整 vLLM 环境中填写真实本地路径执行上述 dry-run，本批不自动安装依赖或启动真实 benchmark。
 
 2026-10-21 跨类型去重修复基于 `research-v0.9.1` 的 `351788175a207bf268d6d14b37dba7f92a4a4d41`，仅改动数据集扩展、对应测试与本说明；没有新增入口、参数或修改原生发送/指标/V1 代码。与修复前 HEAD 对照的 24 组无冲突小样例（参考/固定输出上限、三种数量组合、四个 seed）均得到完全一致的请求顺序、元数据和 stats。本机未重跑用户真实数据的完整 dry-run，仍需用原命令和原 seed 在真实数据上核查过滤计数及各类剩余数量。
+
+### Per-type goodput (evaluation only)
+
+For a mixed run, `--goodput-by-type` configures client-side evaluation only;
+it does not pass SLOs to the Scheduler. It cannot be combined with `--goodput`.
+The four rules must all be present; values are in milliseconds. Supply a new
+output filename with `--goodput-by-type-output`; existing files are not
+replaced. The following values are examples, not recommended thresholds:
+
+```sh
+python benchmarks/benchmark_serving.py --backend vllm --model MODEL \
+  --dataset-name mixed --mixed-chat-path CHAT_PATH --mixed-code-path CODE_PATH \
+  --mixed-summary-path SUMMARY_PATH --mixed-chat-count 40 --mixed-code-count 40 \
+  --mixed-summary-count 40 --num-prompts 120 --mixed-output-len 128 \
+  --goodput-by-type chat.ttft:2000 chat.tpot:30 code.e2el:30000 summary.e2el:20000 \
+  --goodput-by-type-output ./type-goodput-record.json
+python benchmarks/r1_goodput_by_type.py ./type-goodput-record.json
+```
+
+Each record includes normalized seconds, its SHA256, per-run request indices,
+formal attempts and results, the full benchmark duration and the summary.
+The initial probe is excluded. Goodput divides each passing count by the same
+full duration; attainment rates divide by formal attempts including missing or
+failed results. Chat uses the native per-request TPOT convention: `(latency -
+TTFT)/(output_tokens - 1)` for more than one output token and zero otherwise.
+Old records without these identities and metrics cannot be reliably evaluated.
+This change does not alter the native `--goodput` path or serving protocol.
