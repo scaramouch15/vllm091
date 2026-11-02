@@ -74,7 +74,7 @@ from benchmark_dataset import (
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from mixed_workload_dataset import add_mixed_dataset_args, mixed_dataset_from_args
-from r1_goodput_by_type import check_type_args, evaluate, write_evaluation
+from r1_goodput_by_type import check_type_args, evaluate, write_evaluation, IncrementalRecord
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -311,8 +311,8 @@ async def benchmark(
             indices.append(index)
         if len(set(indices)) != len(indices):
             raise ValueError("type goodput requires unique request indices")
-        if os.path.exists(type_output):
-            raise FileExistsError(type_output)
+        if os.path.exists(type_output) or os.path.exists(type_output + ".jsonl"):
+            raise FileExistsError("type goodput output or event log already exists")
 
     collection_contexts = None
     if request_collector is not None:
@@ -390,11 +390,34 @@ async def benchmark(
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     formal_attempts = []
+    type_results = {}
+    type_log = (IncrementalRecord(type_output + ".jsonl", type_slos,
+                {"backend": backend, "expected_formal": len(input_requests)})
+                if type_slos is not None else None)
     async def limited_request_func(request_func_input, pbar, identity):
         async def send():
+            sent = False
             if identity is not None:
-                formal_attempts.append(identity)
-            return await request_func(request_func_input=request_func_input, pbar=pbar)
+                def record_attempt():
+                    nonlocal sent
+                    type_log.emit("attempt", attempt=identity)
+                    formal_attempts.append(identity)
+                    sent = True
+                request_func_input.r1_type_attempt = record_attempt
+            output = await request_func(request_func_input=request_func_input, pbar=pbar)
+            if identity is not None and sent:
+                length = output.output_tokens
+                if output.success and not length:
+                    length = len(tokenizer(output.generated_text, add_special_tokens=False).input_ids)
+                def valid_number(value):
+                    import math
+                    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+                record = {"success": output.success, "error": output.error,
+                          "latency_s": valid_number(output.latency),
+                          "ttft_s": valid_number(output.ttft), "output_tokens": length}
+                type_log.emit("result", request_id=identity["request_id"], result=record)
+                type_results[identity["request_id"]] = record
+            return output
         if semaphore is None:
             return await send()
         async with semaphore:
@@ -476,13 +499,14 @@ async def benchmark(
 
     type_summary = None
     if type_slos is not None:
-        type_results = {}
-        for rid, output, output_len in zip(task_ids, outputs, actual_output_lens):
-            type_results[rid] = {"success": output.success, "latency_s": output.latency,
-                                 "ttft_s": output.ttft, "output_tokens": output_len}
+        if len(formal_attempts) != len(input_requests) or len(type_results) != len(formal_attempts):
+            type_log.close()
+            raise RuntimeError("incomplete type goodput event log; no complete summary written")
         type_summary = evaluate(type_slos, formal_attempts, type_results, benchmark_duration)
         write_evaluation(type_output, type_slos, formal_attempts, type_results,
                          benchmark_duration, type_summary)
+        type_log.emit("complete", duration_s=benchmark_duration)
+        type_log.close()
         for name, values in [*type_summary["types"].items(), ("overall", type_summary["overall"])]:
             print(f"Type goodput {name}: {values}")
 

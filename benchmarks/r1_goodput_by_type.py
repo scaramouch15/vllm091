@@ -132,9 +132,81 @@ def load_and_evaluate(path):
     return evaluate(config, data["attempts"], data["results"], data["duration_s"])
 
 
+class IncrementalRecord:
+    """Opt-in JSONL log; each event is flushed before continuing."""
+    def __init__(self, path, config, metadata):
+        import uuid
+        self.run_id = uuid.uuid4().hex
+        self.file = open(path, "x", encoding="utf-8")
+        self.emit("header", config_seconds=config, config_sha256=config_digest(config), metadata=metadata)
+
+    def emit(self, event, **values):
+        payload = {"event": event, "run_id": self.run_id, **values}
+        self.file.write(json.dumps(payload, sort_keys=True, allow_nan=False) + "\n")
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
+
+def recover_incremental(path):
+    """Read a JSONL log; a missing completion marker always means incomplete."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
+    events = []
+    truncated = False
+    for index, line in enumerate(lines):
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            if index != len(lines) - 1:
+                raise ValueError("invalid JSON in the middle of the event log")
+            truncated = True
+    if not events or events[0].get("event") != "header":
+        raise ValueError("missing event log header")
+    header = events[0]
+    config = header["config_seconds"]
+    if config_digest(config) != header.get("config_sha256"):
+        raise ValueError("configuration digest mismatch")
+    attempts, results, complete = [], {}, None
+    for event in events[1:]:
+        if event.get("run_id") != header.get("run_id"):
+            raise ValueError("run identity mismatch")
+        kind = event.get("event")
+        if complete is not None:
+            raise ValueError("event after completion")
+        if kind == "attempt":
+            attempts.append(event["attempt"])
+        elif kind == "result":
+            rid = event["request_id"]
+            if rid in results:
+                raise ValueError("duplicate result")
+            results[rid] = event["result"]
+        elif kind == "complete":
+            complete = event
+        else:
+            raise ValueError("unknown event type")
+    # Validate IDs even for incomplete logs, without reporting artificial goodput.
+    validated = evaluate(config, attempts, results, 1.0)
+    expected = header.get("metadata", {}).get("expected_formal")
+    is_complete = (complete is not None and not truncated and len(attempts) == len(results)
+                   and isinstance(expected, int) and expected == len(attempts))
+    status = {"status": "complete" if is_complete else "incomplete",
+              "expected_formal": expected,
+              "run_id": header["run_id"], "attempt_count": len(attempts),
+              "result_count": len(results),
+              "missing_result_count": len(attempts) - len(results), "truncated_tail": truncated}
+    if status["status"] == "complete":
+        status["summary"] = evaluate(config, attempts, results, complete["duration_s"])
+    else:
+        status["attained_count"] = validated["overall"]["attained"]
+    return status
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Recalculate per-type goodput from recorded attempts and results")
     parser.add_argument("record_file")
     args = parser.parse_args()
-    print(json.dumps(load_and_evaluate(args.record_file), indent=2, sort_keys=True))
+    result = recover_incremental(args.record_file) if args.record_file.endswith(".jsonl") else load_and_evaluate(args.record_file)
+    print(json.dumps(result, indent=2, sort_keys=True))

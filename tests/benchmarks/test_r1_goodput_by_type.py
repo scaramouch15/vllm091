@@ -66,6 +66,22 @@ class IntegrationContractTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 m.check_type_args(*args)
 
+    def test_interrupted_incremental_log(self):
+        import tempfile
+        config = m.parse_goodput_by_type(["chat.ttft:2", "chat.tpot:3", "code.e2el:4", "summary.e2el:5"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "events.jsonl")
+            writer = m.IncrementalRecord(path, config, {"expected_formal": 2})
+            writer.emit("attempt", attempt={"request_id": "1", "task_type": "chat", "phase": "formal"})
+            writer.emit("attempt", attempt={"request_id": "2", "task_type": "code", "phase": "formal"})
+            writer.emit("result", request_id="1", result={"success": False})
+            writer.close()
+            recovered = m.recover_incremental(path)
+            self.assertEqual(recovered["status"], "incomplete")
+            self.assertEqual((recovered["attempt_count"], recovered["result_count"], recovered["missing_result_count"]), (2, 1, 1))
+            self.assertNotIn("summary", recovered)
+            self.assertNotIn("request_goodput", recovered)
+
     def test_duplicate_and_unknown_id_rejected(self):
         config = m.parse_goodput_by_type(["chat.ttft:1", "chat.tpot:1", "code.e2el:1", "summary.e2el:1"])
         attempt = {"request_id": "a", "task_type": "chat", "phase": "formal"}
@@ -89,6 +105,9 @@ class IntegrationContractTests(unittest.TestCase):
         for arg in node.args.args + node.args.kwonlyargs:
             arg.annotation = None
         async def request_func(request_func_input, **kwargs):
+            callback = getattr(request_func_input, "r1_type_attempt", None)
+            if callback is not None:
+                callback()
             return SimpleNamespace(success=True, error="", latency=2.0, ttft=1.0, output_tokens=101, itl=[], prompt_len=1, generated_text="x")
         async def request_iter(requests, *unused):
             for request in requests:
@@ -101,7 +120,8 @@ class IntegrationContractTests(unittest.TestCase):
         namespace = {"asyncio": asyncio, "time": time, "ASYNC_REQUEST_FUNCS": {"fake": request_func},
                      "RequestFuncInput": Input, "get_request": request_iter,
                      "calculate_metrics": lambda **kwargs: (Metrics(), [101] * len(kwargs["outputs"])),
-                     "evaluate": m.evaluate, "write_evaluation": m.write_evaluation, "os": __import__("os")}
+                     "evaluate": m.evaluate, "write_evaluation": m.write_evaluation,
+                     "IncrementalRecord": m.IncrementalRecord, "os": __import__("os")}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "benchmark_serving.py", "exec"), namespace)
         config = m.parse_goodput_by_type(["chat.ttft:2000", "chat.tpot:30", "code.e2el:30000", "summary.e2el:20000"])
         requests = [SimpleNamespace(prompt="same", prompt_len=1, expected_output_len=10, multi_modal_data=None,
@@ -113,6 +133,9 @@ class IntegrationContractTests(unittest.TestCase):
                 selected_percentile_metrics=[], selected_percentiles=[], ignore_eos=False, goodput_config_dict={}, max_concurrency=None,
                 lora_modules=None, extra_body=None, type_slos=config, type_output=path))
             self.assertEqual(result["goodput_by_type"], m.load_and_evaluate(path))
+            recovered = m.recover_incremental(path + ".jsonl")
+            self.assertEqual(recovered["status"], "complete")
+            self.assertEqual(recovered["summary"], result["goodput_by_type"])
             self.assertEqual(result["goodput_by_type"]["overall"]["attained"], 3)
 
     def test_native_goodput_functions_unchanged(self):

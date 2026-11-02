@@ -144,3 +144,13 @@ failed results. Chat uses the native per-request TPOT convention: `(latency -
 TTFT)/(output_tokens - 1)` for more than one output token and zero otherwise.
 Old records without these identities and metrics cannot be reliably evaluated.
 This change does not alter the native `--goodput` path or serving protocol.
+
+The per-type output also creates `<output>.jsonl` with a generated run ID,
+configuration and flushed attempt/result events. An attempt is recorded just
+before the completions HTTP call; a process interruption can leave attempts
+without results. Recover with `python benchmarks/r1_goodput_by_type.py
+./type-goodput-record.json.jsonl`. Without a valid completion event and all
+expected results the status is `incomplete`; no full-run goodput is reported.
+Flush pushes data to the operating system, but does not guarantee survival of
+power loss or storage failure. Logging performs synchronous writes and is
+included in the benchmark wall-clock duration.

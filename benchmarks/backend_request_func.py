@@ -36,6 +36,7 @@ class RequestFuncInput:
     language: Optional[str] = None
     request_id: Optional[str] = None
     collection_context: Optional[Any] = None
+    r1_type_attempt: Optional[Any] = None
 
 
 @dataclass
@@ -297,6 +298,8 @@ async def async_request_openai_completions(
             headers["X-Request-Id"] = request_func_input.request_id
         st = time.perf_counter()
         most_recent_timestamp = st
+        if request_func_input.r1_type_attempt is not None:
+            request_func_input.r1_type_attempt()
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
