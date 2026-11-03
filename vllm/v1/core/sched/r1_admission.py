@@ -18,8 +18,11 @@ class AdmissionConfig:
     time_observation: bool = False
     wait_limit_seconds: float = None
     budget_seconds: float = None
+    slo_observation: bool = False
 
     def __post_init__(self):
+        if self.slo_observation and self.mode != "observe":
+            raise ValueError("SLO shadow observation requires admission mode observe")
         if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk"):
             raise ValueError("invalid VLLM_R1_ADMISSION_HEAD_POLICY")
         if self.mode in ("observe", "apply") and self.head_policy != "protected" and self.skip_single_slot:
@@ -62,7 +65,11 @@ class AdmissionConfig:
                     budget = float(os.environ["VLLM_R1_ADMISSION_BUDGET_SECONDS"])
             except (KeyError, ValueError) as exc:
                 raise ValueError("conditional policy requires explicit numeric WAIT_LIMIT_SECONDS and, for risk, BUDGET_SECONDS") from exc
-        return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget)
+        slo_observation = os.environ.get("VLLM_R1_SLO_SHADOW", "0")
+        if slo_observation not in ("0", "1"):
+            raise ValueError("VLLM_R1_SLO_SHADOW must be 0 or 1")
+        return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget,
+                   slo_observation == "1")
 
 
 def unsupported_reason(config):
@@ -183,6 +190,17 @@ class AdmissionController:
 
     def prepare(self, scheduler, frame, preempted, token_budget, timestamp):
         start = time.perf_counter_ns()
+        if self.config.slo_observation:
+            state = getattr(scheduler, "r1_type_slo", None)
+            frame["_slo_config_error"] = None
+            try:
+                frame["_slo_config"] = state.snapshot() if state is not None else None
+            except Exception as exc:
+                frame["_slo_config"] = None
+                frame["_slo_config_error"] = type(exc).__name__
+            frame["_slo_timestamp"] = timestamp
+            frame["_slo_log_stats"] = scheduler.log_stats
+            frame["_slo_barrier"] = None
         frame["waiting_size"] = len(scheduler.waiting)
         frame["token_budget"] = token_budget
         frame["available_running_slots"] = (scheduler.max_num_running_reqs -
@@ -206,6 +224,16 @@ class AdmissionController:
             frame["checked"] += 1
             if not self.eligible(r):
                 frame["prefix_stop"] = "ineligible"
+                if self.config.slo_observation:
+                    status = r.status.name
+                    reason = ("preempted" if status == "PREEMPTED" else
+                              "already_admitted" if getattr(r, "r1_shadow_admitted", False) else
+                              "special_status" if status != "WAITING" else
+                              "unsupported_max_tokens" if r.max_tokens != 2048 else
+                              "ineligible_or_no_static")
+                    frame["_slo_barrier"] = {"request_id": r.request_id,
+                                             "request_type": getattr(r, "r1_request_type", None),
+                                             "reason": reason}
                 break
             candidates.append(r)
         if frame["prefix_stop"] == "not_scanned":
@@ -368,6 +396,78 @@ class AdmissionController:
         scheduler.waiting.extendleft(reversed(remaining))
         frame["restore_ns"] = time.perf_counter_ns() - started
 
+    def build_slo_observation(self, frame):
+        """Bounded post-loop description of the already computed decision."""
+        timestamp = frame.get("_slo_timestamp")
+        config = frame.get("_slo_config")
+        candidates = frame["_candidates"]
+        scores = frame["scores_p90"] if frame["reason"] == "success" else ()
+        rows = []
+        by_type = {"code": [], "summary": []}
+        for index, request in enumerate(candidates):
+            kind = getattr(request, "r1_request_type", None)
+            if not isinstance(kind, str) or kind not in ("chat", "code", "summary"):
+                kind = None
+            queued = getattr(request, "r1_first_queued_timestamp", None)
+            time_reason = None
+            if queued is None:
+                time_reason = ("queued_time_unavailable" if frame.get("_slo_log_stats")
+                               else "native_stats_disabled")
+            elif (isinstance(queued, bool) or not isinstance(queued, (int, float))
+                  or not math.isfinite(queued) or timestamp is None
+                  or isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+                  or not math.isfinite(timestamp) or queued > timestamp
+                  or not math.isfinite(timestamp - queued)):
+                time_reason = "queued_time_invalid"
+            wait = None if time_reason else timestamp - queued
+            score = scores[index] if index < len(scores) else None
+            values = config["config_seconds"] if config is not None else {}
+            slo = values.get(kind + ".e2el") if kind in by_type else None
+            reason = ("config_unavailable" if config is None else
+                      "type_missing_or_invalid" if kind not in ("chat", "code", "summary") else
+                      time_reason if time_reason else
+                      "prediction_" + str(frame["reason"]) if score is None else
+                      "slo_missing" if kind in by_type and slo is None else None)
+            reference = None
+            total = None
+            if kind in by_type and reason is None:
+                total = wait + score
+                if not math.isfinite(total) or not math.isfinite(slo - total):
+                    reason = "arithmetic_nonfinite"
+                    total = None
+                else:
+                    reference = slo - total
+                    by_type[kind].append(reference)
+            rows.append({"request_id": request.request_id, "position": index,
+                         "request_type": kind, "queued_timestamp_s": queued if time_reason is None else None,
+                         "wait_s": wait, "wait_status": time_reason or "available",
+                         "inference_p90_s": score,
+                         "prediction_status": "available" if score is not None else "prediction_" + str(frame["reason"]),
+                         "e2e_slo_s": slo, "chat_ttft_slo_s": values.get("chat.ttft") if kind == "chat" else None,
+                         "chat_tpot_slo_s": values.get("chat.tpot") if kind == "chat" else None,
+                         "ttft_risk_status": "not_estimable" if kind == "chat" else None,
+                         "tpot_risk_status": "not_estimable" if kind == "chat" else None,
+                         "wait_plus_p90_s": total,
+                         "reference_slack_s": reference, "missing_reason": reason})
+        comparable = sum(len(group) for group in by_type.values())
+        has_pair = any(len(group) >= 2 for group in by_type.values())
+        differs = any(len(group) >= 2 and min(group) != max(group) for group in by_type.values())
+        return {"schema_version": 1, "candidate_source": "admission_contiguous_prefix",
+                "scheduler_timestamp_s": timestamp,
+                "config_run_id": config.get("run_id") if config else None,
+                "config_sha256": config.get("config_sha256") if config else None,
+                "config_error_type": frame.get("_slo_config_error"),
+                "waiting_size": frame["waiting_size"], "checked": frame["checked"],
+                "window_outside_checked": max(0, frame["waiting_size"] - frame["checked"]) if frame["waiting_size"] is not None else None,
+                "candidate_count": (None if frame["prefix_stop"] == "not_scanned" else len(candidates)),
+                "valid_prediction_count": len(scores),
+                "comparable_count": comparable, "same_type_comparable_pair": has_pair,
+                "same_type_reference_differs": differs if has_pair else None,
+                "available_running_slots": frame["available_running_slots"],
+                "token_budget": frame["token_budget"], "opportunity_id": frame["opportunity_id"],
+                "reason": frame["reason"], "prefix_stop": frame["prefix_stop"],
+                "first_ineligible": frame.get("_slo_barrier"), "candidates": rows}
+
     def finish(self, frame, start):
         log_start = time.perf_counter_ns()
         frame["prediction_successes"] = self.prediction_successes
@@ -376,6 +476,15 @@ class AdmissionController:
         frame["tail_A"] = frame["tail_attempt_count"]
         frame["tail_M"] = len(frame["tail_admitted"])
         frame["actual_admission_order"] = frame["window_admitted"] + frame["tail_admitted"]
+        if self.config.slo_observation:
+            slo_start = time.perf_counter_ns()
+            try:
+                frame["slo_shadow_v1"] = self.build_slo_observation(frame)
+            except Exception as exc:
+                frame["slo_shadow_v1"] = {"schema_version": 1,
+                    "candidate_source": "admission_contiguous_prefix",
+                    "reason": "observation_error", "error_type": type(exc).__name__}
+            frame["slo_construct_ns"] = time.perf_counter_ns() - slo_start
         record = {key: value for key, value in frame.items() if not key.startswith("_")}
         self.shadow.emit("r1_admission_v1", record)
         self.shadow.observe_elapsed("admission_log_foreground_v1", log_start, "complete")
