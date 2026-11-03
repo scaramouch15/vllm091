@@ -85,6 +85,8 @@ class SloShadowTests(base.AdmissionTests):
         obs = self.event(writer)["slo_shadow_v1"]
         self.assertEqual(obs["reason"], "interval_skip")
         self.assertIsNone(obs["candidate_count"])
+        self.assertIsNone(obs["comparable_count"])
+        self.assertIsNone(obs["same_type_comparable_pair"])
         self.assertIsNone(obs["same_type_reference_differs"])
 
     def test_preempted_admitted_barriers_and_writer_loss(self):

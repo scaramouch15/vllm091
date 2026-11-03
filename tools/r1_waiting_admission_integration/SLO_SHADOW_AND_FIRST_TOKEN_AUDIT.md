@@ -154,3 +154,6 @@ underestimation of output length; it must not be transferred to this time head.
 The later B training artifact's exact training wall-clock date is not proven by
 its current filesystem modification time; the dated 2026-10-24 AB/BA report is
 an offline CPU comparison using both artifacts.
+For an unscanned frame, `candidate_count`, `comparable_count` and
+`same_type_comparable_pair` are null: no candidate enumeration was performed.
+They cannot be counted as zero or as evidence that no pair existed.
