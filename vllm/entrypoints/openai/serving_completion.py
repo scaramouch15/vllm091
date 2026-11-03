@@ -84,6 +84,12 @@ class OpenAIServingCompletion(OpenAIServing):
             - suffix (the language models we currently support do not support
             suffix)
         """
+        import os
+        if os.environ.get("VLLM_R1_TYPE_SLO", "0") == "1":
+            if request.r1_request_type not in ("chat", "code", "summary"):
+                return self.create_error_response("r1_request_type must be chat, code or summary")
+            if request.use_beam_search or request.n != 1:
+                return self.create_error_response("R1 type SLO requires n=1 and no beam search")
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
@@ -170,6 +176,10 @@ class OpenAIServingCompletion(OpenAIServing):
                         self.model_config.logits_processor_pattern,
                         self.default_sampling_params)
 
+                if os.environ.get("VLLM_R1_TYPE_SLO", "0") == "1":
+                    if sampling_params.extra_args is None:
+                        sampling_params.extra_args = {}
+                    sampling_params.extra_args["_vllm_r1_request_type"] = request.r1_request_type
                 request_id_item = f"{request_id}-{i}"
                 shadow = getattr(self.engine_client, "r1_shadow", None)
                 if shadow is not None:

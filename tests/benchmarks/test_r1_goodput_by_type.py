@@ -104,7 +104,9 @@ class IntegrationContractTests(unittest.TestCase):
         node.returns = None
         for arg in node.args.args + node.args.kwonlyargs:
             arg.annotation = None
+        sent_bodies = []
         async def request_func(request_func_input, **kwargs):
+            sent_bodies.append(request_func_input.extra_body)
             callback = getattr(request_func_input, "r1_type_attempt", None)
             if callback is not None:
                 callback()
@@ -121,7 +123,8 @@ class IntegrationContractTests(unittest.TestCase):
                      "RequestFuncInput": Input, "get_request": request_iter,
                      "calculate_metrics": lambda **kwargs: (Metrics(), [101] * len(kwargs["outputs"])),
                      "evaluate": m.evaluate, "write_evaluation": m.write_evaluation,
-                     "IncrementalRecord": m.IncrementalRecord, "os": __import__("os")}
+                     "IncrementalRecord": m.IncrementalRecord, "config_digest": m.config_digest,
+                     "os": __import__("os")}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "benchmark_serving.py", "exec"), namespace)
         config = m.parse_goodput_by_type(["chat.ttft:2000", "chat.tpot:30", "code.e2el:30000", "summary.e2el:20000"])
         requests = [SimpleNamespace(prompt="same", prompt_len=1, expected_output_len=10, multi_modal_data=None,
@@ -137,6 +140,28 @@ class IntegrationContractTests(unittest.TestCase):
             self.assertEqual(recovered["status"], "complete")
             self.assertEqual(recovered["summary"], result["goodput_by_type"])
             self.assertEqual(result["goodput_by_type"]["overall"]["attained"], 3)
+            import sys
+            from unittest.mock import patch
+            class Response:
+                status = 200
+                def __init__(self, payload): self.payload = payload
+                async def __aenter__(self): return self
+                async def __aexit__(self, *args): pass
+                async def json(self): return {"run_id": self.payload["run_id"], "config_sha256": self.payload["config_sha256"]}
+            class Session:
+                def __init__(self, **kwargs): pass
+                async def __aenter__(self): return self
+                async def __aexit__(self, *args): pass
+                def post(self, *args, **kwargs): return Response(kwargs["json"])
+            fake = SimpleNamespace(ClientSession=Session, ClientTimeout=lambda **kwargs: None)
+            sent_bodies.clear()
+            namespace["ASYNC_REQUEST_FUNCS"]["vllm"] = request_func
+            with patch.dict(sys.modules, {"aiohttp": fake}):
+                result = asyncio.run(namespace["benchmark"](backend="vllm", api_url="", base_url="", model_id="m", model_name="m", tokenizer=None,
+                    input_requests=requests, logprobs=None, request_rate=float("inf"), burstiness=1, disable_tqdm=True, profile=False,
+                    selected_percentile_metrics=[], selected_percentiles=[], ignore_eos=False, goodput_config_dict={}, max_concurrency=None,
+                    lora_modules=None, extra_body=None, type_slos=config, type_output=str(Path(directory) / "second.json"), r1_type_slo=True))
+            self.assertEqual([body["r1_request_type"] for body in sent_bodies], ["chat", "chat", "code", "summary"])
 
     def test_native_goodput_functions_unchanged(self):
         import ast

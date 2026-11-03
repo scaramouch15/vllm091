@@ -749,6 +749,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
 
 class CompletionRequest(OpenAIBaseModel):
+    r1_request_type: Optional[str] = None
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: Optional[str] = None

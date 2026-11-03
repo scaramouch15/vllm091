@@ -172,6 +172,25 @@ class EngineCore:
                      "warmup model) took %.2f seconds"), elapsed)
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
 
+    def r1_initialize_type_slos(self, run_id: str, values: dict,
+                                expected_digest: str) -> dict:
+        state = getattr(self.scheduler, "r1_type_slo", None)
+        if state is None:
+            raise ValueError("VLLM_R1_TYPE_SLO is not enabled")
+        result = state.initialize(run_id, values, expected_digest)
+        logger.info("R1 type SLO initialized run_id=%s config_sha256=%s",
+                    result["run_id"], result["config_sha256"])
+        return result
+
+    def r1_validate_type_request(self, request_type: str) -> dict:
+        state = getattr(self.scheduler, "r1_type_slo", None)
+        if state is None:
+            raise ValueError("VLLM_R1_TYPE_SLO is not enabled")
+        state.validate_request_type(request_type)
+        snapshot = state.snapshot()
+        return {"run_id": snapshot["run_id"],
+                "config_sha256": snapshot["config_sha256"]}
+
     def add_request(self, request: EngineCoreRequest):
         """Add request to the scheduler."""
 

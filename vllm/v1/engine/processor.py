@@ -346,6 +346,8 @@ class Processor:
             cache_salt=decoder_inputs.get("cache_salt"),
             data_parallel_rank=data_parallel_rank,
             r1_shadow_lengths=shadow_lengths,
+            r1_request_type=(sampling_params.extra_args or {}).pop(
+                "_vllm_r1_request_type", None),
         )
 
     def _validate_model_inputs(self,

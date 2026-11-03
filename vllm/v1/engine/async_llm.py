@@ -258,6 +258,14 @@ class AsyncLLM(EngineClient):
 
         assert isinstance(params, SamplingParams), \
             "Pooling is not supported in V1"
+        import os
+        if os.environ.get("VLLM_R1_TYPE_SLO", "0") == "1":
+            request_type = (params.extra_args or {}).get("_vllm_r1_request_type")
+            try:
+                await self.engine_core.call_utility_async(
+                    "r1_validate_type_request", request_type)
+            except Exception as exc:
+                raise ValueError(f"R1 type SLO request rejected: {exc}") from exc
         if self.collection_config is not None:
             self.collection_config.validate_engine_request(request_id, params)
 

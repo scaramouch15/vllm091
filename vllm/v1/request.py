@@ -32,6 +32,7 @@ class Request:
         structured_output_request: Optional["StructuredOutputRequest"] = None,
         cache_salt: Optional[str] = None,
         r1_shadow_lengths: Optional[tuple[float, float, float]] = None,
+        r1_request_type: Optional[str] = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -51,6 +52,7 @@ class Request:
 
         self.prompt_token_ids = prompt_token_ids
         self.num_prompt_tokens = len(self.prompt_token_ids)
+        self.r1_request_type = r1_request_type
         self.r1_shadow_lengths = r1_shadow_lengths
         if r1_shadow_lengths is not None:
             self.r1_shadow_admitted = False
@@ -109,6 +111,7 @@ class Request:
                 sampling_params=request.sampling_params),
             cache_salt=request.cache_salt,
             r1_shadow_lengths=request.r1_shadow_lengths,
+            r1_request_type=request.r1_request_type,
         )
 
     def append_output_token_ids(

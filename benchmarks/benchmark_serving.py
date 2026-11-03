@@ -74,7 +74,7 @@ from benchmark_dataset import (
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from mixed_workload_dataset import add_mixed_dataset_args, mixed_dataset_from_args
-from r1_goodput_by_type import check_type_args, evaluate, write_evaluation, IncrementalRecord
+from r1_goodput_by_type import check_type_args, evaluate, write_evaluation, IncrementalRecord, config_digest
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -295,6 +295,7 @@ async def benchmark(
     request_collector: Optional[Any] = None,
     type_slos: Optional[dict] = None,
     type_output: Optional[str] = None,
+    r1_type_slo: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -313,6 +314,28 @@ async def benchmark(
             raise ValueError("type goodput requires unique request indices")
         if os.path.exists(type_output) or os.path.exists(type_output + ".jsonl"):
             raise FileExistsError("type goodput output or event log already exists")
+
+    experiment_run_id = None
+    if r1_type_slo:
+        if type_slos is None or backend != "vllm":
+            raise ValueError("R1 type SLO requires --goodput-by-type and --backend vllm")
+        if profile:
+            raise ValueError("R1 type SLO does not support --profile")
+        import aiohttp
+        import uuid
+        experiment_run_id = uuid.uuid4().hex
+        digest = config_digest(type_slos)
+        auth_headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.post(base_url + "/v1/r1/type-slo/init", headers=auth_headers, json={
+                "run_id": experiment_run_id, "config_seconds": type_slos,
+                "config_sha256": digest}) as response:
+                if response.status != 200:
+                    raise ValueError(f"R1 initialization failed: HTTP {response.status}")
+                acknowledgement = await response.json()
+        if acknowledgement != {"run_id": experiment_run_id, "config_sha256": digest}:
+            raise ValueError("R1 initialization acknowledgement mismatch")
+        print(f"R1 scheduler initialization confirmed: run_id={experiment_run_id} config_sha256={digest}")
 
     collection_contexts = None
     if request_collector is not None:
@@ -337,7 +360,8 @@ async def benchmark(
         logprobs=logprobs,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
-        extra_body=extra_body,
+        extra_body=({**(extra_body or {}), "r1_request_type": input_requests[0].metadata["task_type"]}
+                    if r1_type_slo else extra_body),
     )
     if request_collector is not None:
         test_input.collection_context = request_collector.probe(input_requests[0])
@@ -392,7 +416,8 @@ async def benchmark(
     formal_attempts = []
     type_results = {}
     type_log = (IncrementalRecord(type_output + ".jsonl", type_slos,
-                {"backend": backend, "expected_formal": len(input_requests)})
+                {"backend": backend, "expected_formal": len(input_requests),
+                 "scheduler_config_confirmed": r1_type_slo}, run_id=experiment_run_id)
                 if type_slos is not None else None)
     async def limited_request_func(request_func_input, pbar, identity):
         async def send():
@@ -448,7 +473,8 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
-            extra_body=extra_body,
+            extra_body=({**(extra_body or {}), "r1_request_type": request.metadata["task_type"]}
+                        if r1_type_slo else extra_body),
         )
         if collection_contexts is not None:
             request_func_input.collection_context = collection_contexts[id(request)]
@@ -952,6 +978,7 @@ def main(args: argparse.Namespace):
                 request_collector=request_collector,
                 type_slos=type_slos,
                 type_output=args.goodput_by_type_output,
+                r1_type_slo=args.r1_type_slo,
             )
         )
     finally:
@@ -1228,6 +1255,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--goodput-by-type", nargs="+", default=None,
                         help="Mixed-request per-type SLOs in milliseconds; evaluation only, not scheduler configuration.")
+    parser.add_argument("--r1-type-slo", action="store_true",
+                        help="Initialize scheduler SLO configuration and send mixed request types.")
     parser.add_argument("--goodput-by-type-output", default=None,
                         help="New JSON file for per-request evaluation and offline recalculation.")
 

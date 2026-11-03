@@ -563,6 +563,25 @@ async def create_chat_completion(request: ChatCompletionRequest,
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
+@router.post("/v1/r1/type-slo/init", dependencies=[Depends(validate_json_request)])
+async def r1_type_slo_init(raw_request: Request):
+    import os
+    if os.environ.get("VLLM_R1_TYPE_SLO", "0") != "1":
+        raise HTTPException(status_code=404, detail="R1 type SLO disabled")
+    payload = await raw_request.json()
+    if not isinstance(payload, dict) or set(payload) != {"run_id", "config_seconds", "config_sha256"}:
+        raise HTTPException(status_code=400, detail="invalid R1 type SLO initialization")
+    client = engine_client(raw_request)
+    try:
+        result = await client.engine_core.call_utility_async(
+            "r1_initialize_type_slos", payload["run_id"],
+            payload["config_seconds"], payload["config_sha256"])
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raw_request.app.state.r1_type_slo_confirmed = result
+    return JSONResponse(content=result)
+
+
 @router.post("/v1/completions",
              dependencies=[Depends(validate_json_request)],
              responses={
@@ -584,6 +603,10 @@ async def create_chat_completion(request: ChatCompletionRequest,
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    import os
+    if (os.environ.get("VLLM_R1_TYPE_SLO", "0") == "1" and
+            getattr(raw_request.app.state, "r1_type_slo_confirmed", None) is None):
+        raise HTTPException(status_code=400, detail="R1 type SLO not initialized")
     handler = completion(raw_request)
     if handler is None:
         return base(raw_request).create_error_response(
@@ -1024,6 +1047,18 @@ def build_app(args: Namespace) -> FastAPI:
         app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     app.root_path = args.root_path
+
+    if os.environ.get("VLLM_R1_TYPE_SLO", "0") == "1":
+        @app.middleware("http")
+        async def r1_type_slo_supported_routes(request: Request, call_next):
+            path = request.url.path
+            if app.root_path and path.startswith(app.root_path):
+                path = path[len(app.root_path):]
+            if request.method == "POST" and path not in (
+                    "/v1/completions", "/v1/r1/type-slo/init"):
+                return JSONResponse(status_code=400, content={
+                    "error": "R1 type SLO experiment supports only /v1/completions"})
+            return await call_next(request)
 
     mount_metrics(app)
 

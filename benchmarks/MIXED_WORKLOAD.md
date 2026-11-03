@@ -154,3 +154,33 @@ expected results the status is `incomplete`; no full-run goodput is reported.
 Flush pushes data to the operating system, but does not guarantee survival of
 power loss or storage failure. Logging performs synchronous writes and is
 included in the benchmark wall-clock duration.
+
+### Experimental scheduler type/SLO metadata
+
+Start the V1 server with `VLLM_R1_TYPE_SLO=1` for this opt-in experiment.
+It supports DP=1 and HTTP completions only; other POST endpoints return an
+error while enabled. The setting is disabled by default. Supply the existing
+`--goodput-by-type` and `--goodput-by-type-output` arguments plus
+`--r1-type-slo` on the client. The client initializes the Scheduler once at
+`/v1/r1/type-slo/init` and checks the returned run ID and configuration digest
+before sending the initial probe or formal requests. Each completions request
+carries its type; per-request SLO values are not sent. The Scheduler retains
+one immutable run/configuration pair; changing runs requires a server restart.
+The endpoint uses the server's normal `/v1` API-key middleware when configured.
+
+Type and SLO data are recorded for future research only. They do not change
+prediction features, admission ordering, or existing scheduling decisions.
+The experiment adds one EngineCore utility round trip for each request; this
+cost is not part of the previous first-batch benchmark configuration.
+The new path is not verified on a live service or actual GPU in this repository.
+
+For later Linux validation, use the server's compatible vLLM 0.9.1 environment
+and inspect server logs for `R1 type SLO initialized` and `R1 type SLO request`.
+First check that an uninitialized completion and requests with absent or invalid
+`r1_request_type` receive errors without terminating EngineCore. Then run a
+small mixed benchmark with `--r1-type-slo --goodput-by-type ...` and verify the
+probe and formal requests' types, run ID, and digest against the Scheduler log
+and client JSONL header. Verify that a different run ID or changed configuration
+is rejected, and repeat ordinary completions with the experiment switched off.
+An integration run on Linux is required: local tests include stubs and a
+msgspec byte pipe, and are not a full EngineCore process or server test.

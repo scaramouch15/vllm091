@@ -69,6 +69,7 @@ class EngineCoreRequest(
     # Optional shadow-only numbers; frontend text never crosses Core IPC.
     # Appended to preserve existing array positions; use matching frontend/Core.
     r1_shadow_lengths: Optional[tuple[float, float, float]] = None
+    r1_request_type: Optional[str] = None
 
 
 class EngineCoreEventType(enum.IntEnum):

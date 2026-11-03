@@ -434,7 +434,8 @@ class ShadowTests(unittest.TestCase):
         kwargs = dict(request_id="ordinary-id", prompt_token_ids=[1, 2],
                       mm_inputs=None, mm_hashes=None, mm_placeholders=None,
                       sampling_params=native.params(max_tokens=2048),
-                      eos_token_id=None, client_index=0, lora_request=None, cache_salt=None)
+                      eos_token_id=None, client_index=0, lora_request=None, cache_salt=None,
+                      r1_request_type=None)
         for lengths in (None, (1., 2., 3.)):
             ecr = NS(**kwargs, r1_shadow_lengths=lengths)
             r = native.N["Request"].from_engine_core_request(ecr)
@@ -460,7 +461,8 @@ class ShadowTests(unittest.TestCase):
         obj.input_preprocessor = NS(preprocess=lambda *a, **kw:
             {"type": "token", "prompt_token_ids": [1, 2]}, get_eos_token_id=lambda _: 0)
         value = S.StaticEnvelope(2, 2048, (1., 2., 3.))
-        params = native.params(max_tokens=2048, extra_args={S.INTERNAL_KEY: value, "other": 9})
+        params = native.params(max_tokens=2048, extra_args={S.INTERNAL_KEY: value, "other": 9,
+                                                          "_vllm_r1_request_type": "chat"})
         def clone():
             return native.params(max_tokens=params.max_tokens,
                 extra_args=copy.deepcopy(params.extra_args),
@@ -472,10 +474,12 @@ class ShadowTests(unittest.TestCase):
                                      "vllm.v1.metrics.r1_shadow": S}):
             _, ecr = obj.process_inputs("not-a-required-prefix", {"prompt_token_ids": [1, 2]}, params)
         self.assertEqual(ecr.r1_shadow_lengths, (1., 2., 3.))
+        self.assertEqual(ecr.r1_request_type, "chat")
         self.assertEqual(ecr.sampling_params.extra_args, {"other": 9})
         self.assertEqual(params.extra_args[S.INTERNAL_KEY], value)
         r = native.N["Request"].from_engine_core_request(NS(**vars(ecr), client_index=0))
         self.assertEqual(r.r1_shadow_lengths, (1., 2., 3.))
+        self.assertEqual(r.r1_request_type, "chat")
         self.assertFalse(r.r1_shadow_admitted)
 
     def test_actual_completion_calls_static_once_and_ordinary_id_is_accepted(self):

@@ -177,6 +177,15 @@ class Scheduler(SchedulerInterface):
             })
 
         import os
+        r1_type_enabled = os.environ.get("VLLM_R1_TYPE_SLO", "0")
+        if r1_type_enabled not in ("0", "1"):
+            raise ValueError("VLLM_R1_TYPE_SLO must be 0 or 1")
+        self.r1_type_slo = None
+        if r1_type_enabled == "1":
+            if vllm_config.parallel_config.data_parallel_size != 1:
+                raise ValueError("R1 type SLO requires data_parallel_size=1")
+            from vllm.v1.core.sched.r1_type_slo_state import ExperimentState
+            self.r1_type_slo = ExperimentState()
         self.r1_admission_mode = os.environ.get("VLLM_R1_ADMISSION_MODE", "off")
         self.r1_admission = None
         admission_config = None
@@ -980,6 +989,12 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+        if getattr(self, "r1_type_slo", None) is not None:
+            r1_snapshot = self.r1_type_slo.snapshot()
+            if r1_snapshot is not None:
+                logger.info("R1 type SLO request request_id=%s type=%s run_id=%s config_sha256=%s",
+                            request.request_id, request.r1_request_type,
+                            r1_snapshot["run_id"], r1_snapshot["config_sha256"])
         self.waiting.append(request)
         self.requests[request.request_id] = request
         if self.log_stats:

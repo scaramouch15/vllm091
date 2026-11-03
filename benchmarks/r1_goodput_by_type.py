@@ -134,9 +134,9 @@ def load_and_evaluate(path):
 
 class IncrementalRecord:
     """Opt-in JSONL log; each event is flushed before continuing."""
-    def __init__(self, path, config, metadata):
+    def __init__(self, path, config, metadata, run_id=None):
         import uuid
-        self.run_id = uuid.uuid4().hex
+        self.run_id = run_id if run_id is not None else uuid.uuid4().hex
         self.file = open(path, "x", encoding="utf-8")
         self.emit("header", config_seconds=config, config_sha256=config_digest(config), metadata=metadata)
 
