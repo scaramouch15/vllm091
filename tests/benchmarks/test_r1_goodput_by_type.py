@@ -147,7 +147,7 @@ class IntegrationContractTests(unittest.TestCase):
                 def __init__(self, payload): self.payload = payload
                 async def __aenter__(self): return self
                 async def __aexit__(self, *args): pass
-                async def json(self): return {"run_id": self.payload["run_id"], "config_sha256": self.payload["config_sha256"]}
+                async def json(self): return {"run_id": self.payload["run_id"], "config_sha256": self.payload["config_sha256"], "instance_id": "scheduler-1"}
             class Session:
                 def __init__(self, **kwargs): pass
                 async def __aenter__(self): return self

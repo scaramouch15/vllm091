@@ -348,6 +348,8 @@ class Processor:
             r1_shadow_lengths=shadow_lengths,
             r1_request_type=(sampling_params.extra_args or {}).pop(
                 "_vllm_r1_request_type", None),
+            r1_type_slo_instance=(sampling_params.extra_args or {}).pop(
+                "_vllm_r1_type_slo_instance", None),
         )
 
     def _validate_model_inputs(self,

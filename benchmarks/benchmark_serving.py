@@ -333,7 +333,11 @@ async def benchmark(
                 if response.status != 200:
                     raise ValueError(f"R1 initialization failed: HTTP {response.status}")
                 acknowledgement = await response.json()
-        if acknowledgement != {"run_id": experiment_run_id, "config_sha256": digest}:
+        if (not isinstance(acknowledgement, dict)
+                or acknowledgement.get("run_id") != experiment_run_id
+                or acknowledgement.get("config_sha256") != digest
+                or not isinstance(acknowledgement.get("instance_id"), str)
+                or not acknowledgement["instance_id"]):
             raise ValueError("R1 initialization acknowledgement mismatch")
         print(f"R1 scheduler initialization confirmed: run_id={experiment_run_id} config_sha256={digest}")
 
@@ -417,7 +421,9 @@ async def benchmark(
     type_results = {}
     type_log = (IncrementalRecord(type_output + ".jsonl", type_slos,
                 {"backend": backend, "expected_formal": len(input_requests),
-                 "scheduler_config_confirmed": r1_type_slo}, run_id=experiment_run_id)
+                 "scheduler_config_confirmed": r1_type_slo,
+                 "scheduler_instance_id": (acknowledgement["instance_id"]
+                                           if r1_type_slo else None)}, run_id=experiment_run_id)
                 if type_slos is not None else None)
     async def limited_request_func(request_func_input, pbar, identity):
         async def send():

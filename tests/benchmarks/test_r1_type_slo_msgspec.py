@@ -21,10 +21,11 @@ class EngineCoreRequestCodecTests(unittest.TestCase):
             item = cls(request_id="id", prompt_token_ids=[1], mm_inputs=None, mm_hashes=None,
                        mm_placeholders=None, sampling_params=SamplingParams(), eos_token_id=None,
                        arrival_time=1.0, lora_request=None, cache_salt=None, data_parallel_rank=None,
-                       r1_request_type=task)
+                       r1_request_type=task, r1_type_slo_instance="instance-1")
             wire = msgspec.msgpack.encode(item)
             result = msgspec.msgpack.decode(wire, type=cls)
             self.assertEqual(result.r1_request_type, task)
+            self.assertEqual(result.r1_type_slo_instance, "instance-1")
             # Exercise a real child-process byte pipe. The child only echoes the
             # bytes; it is not an EngineCore or a full vLLM installation.
             import subprocess
@@ -34,6 +35,7 @@ class EngineCoreRequestCodecTests(unittest.TestCase):
                 input=wire, stdout=subprocess.PIPE, check=True)
             decoded = msgspec.msgpack.decode(child.stdout, type=cls)
             self.assertEqual(decoded.r1_request_type, task)
+            self.assertEqual(decoded.r1_type_slo_instance, "instance-1")
 
 if __name__ == "__main__":
     unittest.main()

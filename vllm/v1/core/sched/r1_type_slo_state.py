@@ -5,6 +5,7 @@ This module only stores metadata; it does not take scheduling decisions.
 import hashlib
 import json
 import math
+import uuid
 
 _KEYS = frozenset(("chat.ttft", "chat.tpot", "code.e2el", "summary.e2el"))
 _TYPES = frozenset(("chat", "code", "summary"))
@@ -30,6 +31,7 @@ def slo_digest(values):
 
 class ExperimentState:
     def __init__(self):
+        self._instance_id = uuid.uuid4().hex
         self._run_id = None
         self._values = None
         self._digest = None
@@ -44,7 +46,8 @@ class ExperimentState:
         if self._run_id is not None and (run_id != self._run_id or normalized != self._values):
             raise ValueError("experiment already initialized with a different run or SLO configuration")
         self._run_id, self._values, self._digest = run_id, normalized, digest
-        return {"run_id": self._run_id, "config_sha256": self._digest}
+        return {"run_id": self._run_id, "config_sha256": self._digest,
+                "instance_id": self._instance_id}
 
     def validate_request_type(self, request_type):
         if self._run_id is None:
@@ -57,4 +60,5 @@ class ExperimentState:
         if self._run_id is None:
             return None
         return {"run_id": self._run_id, "config_sha256": self._digest,
+                "instance_id": self._instance_id,
                 "config_seconds": dict(self._values)}

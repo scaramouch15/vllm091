@@ -462,7 +462,8 @@ class ShadowTests(unittest.TestCase):
             {"type": "token", "prompt_token_ids": [1, 2]}, get_eos_token_id=lambda _: 0)
         value = S.StaticEnvelope(2, 2048, (1., 2., 3.))
         params = native.params(max_tokens=2048, extra_args={S.INTERNAL_KEY: value, "other": 9,
-                                                          "_vllm_r1_request_type": "chat"})
+                                                          "_vllm_r1_request_type": "chat",
+                                                          "_vllm_r1_type_slo_instance": "instance-1"})
         def clone():
             return native.params(max_tokens=params.max_tokens,
                 extra_args=copy.deepcopy(params.extra_args),
@@ -475,6 +476,7 @@ class ShadowTests(unittest.TestCase):
             _, ecr = obj.process_inputs("not-a-required-prefix", {"prompt_token_ids": [1, 2]}, params)
         self.assertEqual(ecr.r1_shadow_lengths, (1., 2., 3.))
         self.assertEqual(ecr.r1_request_type, "chat")
+        self.assertEqual(ecr.r1_type_slo_instance, "instance-1")
         self.assertEqual(ecr.sampling_params.extra_args, {"other": 9})
         self.assertEqual(params.extra_args[S.INTERNAL_KEY], value)
         r = native.N["Request"].from_engine_core_request(NS(**vars(ecr), client_index=0))

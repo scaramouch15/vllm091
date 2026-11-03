@@ -180,6 +180,8 @@ class OpenAIServingCompletion(OpenAIServing):
                     if sampling_params.extra_args is None:
                         sampling_params.extra_args = {}
                     sampling_params.extra_args["_vllm_r1_request_type"] = request.r1_request_type
+                    sampling_params.extra_args["_vllm_r1_type_slo_instance"] = (
+                        raw_request.app.state.r1_type_slo_confirmed["instance_id"])
                 request_id_item = f"{request_id}-{i}"
                 shadow = getattr(self.engine_client, "r1_shadow", None)
                 if shadow is not None:

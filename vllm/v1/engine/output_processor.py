@@ -346,6 +346,12 @@ class OutputProcessor:
                 # Ignore output for already-aborted request.
                 continue
 
+            if engine_core_output.r1_error is not None:
+                if req_state.queue is not None:
+                    req_state.queue.put(ValueError(engine_core_output.r1_error))
+                self.abort_requests((req_id,))
+                continue
+
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(req_state, engine_core_output,
                                            engine_core_timestamp,

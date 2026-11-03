@@ -20,7 +20,12 @@ class StateTests(unittest.TestCase):
 
     def test_digest_and_idempotence(self):
         self.assertEqual(state_module.slo_digest(state_module.normalize_slos(self.values)), self.digest)
-        expected = {"run_id": "run-a", "config_sha256": self.digest}
+        expected = self.state.initialize("run-a", self.values, self.digest)
+        self.assertEqual(expected["run_id"], "run-a")
+        self.assertEqual(expected["config_sha256"], self.digest)
+        self.assertTrue(expected["instance_id"])
+        restarted = state_module.ExperimentState().initialize("run-a", self.values, self.digest)
+        self.assertNotEqual(expected["instance_id"], restarted["instance_id"])
         self.assertEqual(self.state.initialize("run-a", self.values, self.digest), expected)
         self.assertEqual(self.state.initialize("run-a", self.values, self.digest), expected)
         self.assertEqual(self.state.snapshot()["config_seconds"], self.values)
@@ -59,13 +64,11 @@ class CoreStateBindingTests(unittest.TestCase):
         core = types.SimpleNamespace(scheduler=types.SimpleNamespace(r1_type_slo=state))
         values = client.parse_goodput_by_type(["chat.ttft:2000", "chat.tpot:30", "code.e2el:30000", "summary.e2el:20000"])
         digest = client.config_digest(values)
-        with self.assertRaises(ValueError): namespace["r1_validate_type_request"](core, "chat")
-        self.assertEqual(namespace["r1_initialize_type_slos"](core, "run", values, digest), {"run_id": "run", "config_sha256": digest})
+        acknowledgement = namespace["r1_initialize_type_slos"](core, "run", values, digest)
+        self.assertEqual(acknowledgement["run_id"], "run")
+        self.assertEqual(acknowledgement["config_sha256"], digest)
+        self.assertEqual(acknowledgement["instance_id"], state.snapshot()["instance_id"])
         self.assertEqual(state.snapshot()["config_seconds"], values)
-        for kind in ("chat", "code", "summary"):
-            self.assertEqual(namespace["r1_validate_type_request"](core, kind)["config_sha256"], digest)
-        for kind in (None, "unknown"):
-            with self.assertRaises(ValueError): namespace["r1_validate_type_request"](core, kind)
         with self.assertRaises(ValueError): namespace["r1_initialize_type_slos"](core, "another", values, digest)
 
 if __name__ == "__main__":

@@ -170,8 +170,10 @@ The endpoint uses the server's normal `/v1` API-key middleware when configured.
 
 Type and SLO data are recorded for future research only. They do not change
 prediction features, admission ordering, or existing scheduling decisions.
-The experiment adds one EngineCore utility round trip for each request; this
-cost is not part of the previous first-batch benchmark configuration.
+The initialization uses an EngineCore utility round trip once; individual
+requests use the normal ADD/response path with no per-request utility call.
+Each request carries the confirmed Scheduler instance identity so that a Core
+restart or stale configuration is rejected before admission.
 The new path is not verified on a live service or actual GPU in this repository.
 
 For later Linux validation, use the server's compatible vLLM 0.9.1 environment

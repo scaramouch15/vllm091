@@ -180,8 +180,9 @@ class Scheduler(SchedulerInterface):
         r1_type_enabled = os.environ.get("VLLM_R1_TYPE_SLO", "0")
         if r1_type_enabled not in ("0", "1"):
             raise ValueError("VLLM_R1_TYPE_SLO must be 0 or 1")
+        self.r1_type_slo_enabled = r1_type_enabled == "1"
         self.r1_type_slo = None
-        if r1_type_enabled == "1":
+        if self.r1_type_slo_enabled:
             if vllm_config.parallel_config.data_parallel_size != 1:
                 raise ValueError("R1 type SLO requires data_parallel_size=1")
             from vllm.v1.core.sched.r1_type_slo_state import ExperimentState

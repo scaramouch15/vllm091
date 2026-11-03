@@ -31,7 +31,7 @@ from vllm.v1.core.kv_cache_utils import (get_kv_cache_config,
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as V1Scheduler
-from vllm.v1.engine import (EngineCoreOutputs, EngineCoreRequest,
+from vllm.v1.engine import (EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
                             EngineCoreRequestType, UtilityOutput)
 from vllm.v1.engine.mm_input_cache import MirroredProcessingCache
 from vllm.v1.executor.abstract import Executor
@@ -181,15 +181,6 @@ class EngineCore:
         logger.info("R1 type SLO initialized run_id=%s config_sha256=%s",
                     result["run_id"], result["config_sha256"])
         return result
-
-    def r1_validate_type_request(self, request_type: str) -> dict:
-        state = getattr(self.scheduler, "r1_type_slo", None)
-        if state is None:
-            raise ValueError("VLLM_R1_TYPE_SLO is not enabled")
-        state.validate_request_type(request_type)
-        snapshot = state.snapshot()
-        return {"run_id": snapshot["run_id"],
-                "config_sha256": snapshot["config_sha256"]}
 
     def add_request(self, request: EngineCoreRequest):
         """Add request to the scheduler."""
@@ -597,6 +588,20 @@ class EngineCoreProc(EngineCore):
         """Dispatch request from client."""
 
         if request_type == EngineCoreRequestType.ADD:
+            if getattr(self.scheduler, "r1_type_slo_enabled", False):
+                try:
+                    state = getattr(self.scheduler, "r1_type_slo", None)
+                    if state is None:
+                        raise ValueError("R1 type SLO state unavailable; reinitialize")
+                    state.validate_request_type(request.r1_request_type)
+                    if request.r1_type_slo_instance != state.snapshot()["instance_id"]:
+                        raise ValueError("R1 type SLO configuration is stale; reinitialize")
+                except ValueError as exc:
+                    self.output_queue.put_nowait((request.client_index,
+                        EngineCoreOutputs(outputs=[EngineCoreOutput(
+                            request_id=request.request_id, new_token_ids=[],
+                            r1_error=str(exc))])))
+                    return
             self.add_request(request)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)

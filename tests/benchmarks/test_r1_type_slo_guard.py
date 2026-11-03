@@ -39,11 +39,10 @@ class FrontendGuardTests(unittest.TestCase):
         run = namespace["add_request"]
         async def exercise():
             fake = Fake()
+            async def unexpected_utility(*args):
+                raise AssertionError("per-request utility must not be called")
+            fake.engine_core.call_utility_async = unexpected_utility
             with patch.dict(os.environ, {"VLLM_R1_TYPE_SLO": "1"}):
-                for value in (None, "other", "chat"):
-                    with self.assertRaises(ValueError): await run(fake, "id", "text", Params(value))
-                    self.assertFalse(fake.added)
-                fake.engine_core.initialized = True
                 await run(fake, "id", "text", Params("code"))
                 self.assertTrue(fake.added)
             fake.added = False

@@ -70,6 +70,7 @@ class EngineCoreRequest(
     # Appended to preserve existing array positions; use matching frontend/Core.
     r1_shadow_lengths: Optional[tuple[float, float, float]] = None
     r1_request_type: Optional[str] = None
+    r1_type_slo_instance: Optional[str] = None
 
 
 class EngineCoreEventType(enum.IntEnum):
@@ -116,6 +117,7 @@ class EngineCoreOutput(
 
     # The number of tokens with prefix cache hits.
     num_cached_tokens: int = 0
+    r1_error: Optional[str] = None
 
     @property
     def finished(self) -> bool:
