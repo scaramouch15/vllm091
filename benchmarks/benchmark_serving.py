@@ -759,7 +759,17 @@ def main(args: argparse.Namespace):
         )
 
     if args.dataset_name == "mixed":
-        input_requests = mixed_dataset.sample(tokenizer, args.num_prompts)
+        approved_path = getattr(args, "mixed_approved_manifest", None)
+        approved_split = getattr(args, "mixed_approved_split", None)
+        if bool(approved_path) != bool(approved_split):
+            raise ValueError("mixed approved manifest and split must be provided together")
+        if approved_path:
+            from r1_prefill_manifest import read_json, replay
+            input_requests = replay(read_json(approved_path), mixed_dataset, tokenizer,
+                                    str(tokenizer_id), tokenizer_mode, approved_split)
+            args.num_prompts = len(input_requests)
+        else:
+            input_requests = mixed_dataset.sample(tokenizer, args.num_prompts)
         if args.mixed_export_path:
             mixed_dataset.export(
                 args.mixed_export_path,

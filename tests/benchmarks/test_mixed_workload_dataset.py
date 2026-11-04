@@ -736,6 +736,7 @@ class MixedDatasetTests(unittest.TestCase):
             "mixed_dataset_from_args": MIXED.mixed_dataset_from_args,
             "add_mixed_dataset_args": MIXED.add_mixed_dataset_args,
             "check_goodput_args": lambda args: {},
+            "check_type_args": lambda *args: None,
             "ShareGPTDataset": NATIVE.ShareGPTDataset,
         }
         compile_nodes(
@@ -799,6 +800,28 @@ class MixedDatasetTests(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "local --tokenizer"),
         ):
             namespace["main"](args)
+
+    def test_approved_replay_through_benchmark_main(self):
+        namespace, captures, _ = self.load_native_main()
+        (self.root / "tokenizer.json").write_text("{}", encoding="utf-8")
+        candidate = self.root / "candidate.json"
+        command = self.command() + ["--mixed-output-len", "2048"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            namespace["main"](namespace["parser"].parse_args(
+                command + ["--mixed-dry-run", "--mixed-export-path", str(candidate)]))
+        spec = importlib.util.spec_from_file_location(
+            "r1_prefill_manifest", BENCHMARKS / "r1_prefill_manifest.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        approved = module.partition(json.loads(candidate.read_text(encoding="utf-8")), {}, 42)
+        split = next(name for name, rows in approved["splits"].items() if rows)
+        path = self.root / "approved.json"
+        path.write_text(json.dumps(approved), encoding="utf-8")
+        with patch.dict(sys.modules, {"r1_prefill_manifest": module}), contextlib.redirect_stdout(io.StringIO()):
+            namespace["main"](namespace["parser"].parse_args(
+                command + ["--mixed-approved-manifest", str(path), "--mixed-approved-split", split]))
+        self.assertEqual([r.metadata for r in captures[-1]["input_requests"]],
+                         approved["splits"][split])
 
     def test_native_main_backends_sampling_body_and_nonmixed(self):
         namespace, captures, _ = self.load_native_main()

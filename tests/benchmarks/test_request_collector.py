@@ -303,6 +303,7 @@ def engine_output(request_id, reason=None, events=None):
         stop_reason=None,
         kv_transfer_params=None,
         num_cached_tokens=0,
+        r1_error=None,
         events=events,
     )
 
@@ -1159,6 +1160,9 @@ class CollectorTests(unittest.TestCase):
                     ignore_eos=False,
                     save_result=False,
                     append_result=False,
+                    goodput=None,
+                    goodput_by_type_output=None,
+                    r1_type_slo=False,
                 )
                 received = []
 
@@ -1180,6 +1184,7 @@ class CollectorTests(unittest.TestCase):
                     ),
                     get_tokenizer=lambda *args, **kwargs: NS(),
                     check_goodput_args=lambda _: {},
+                    check_type_args=lambda *args: None,
                     OPENAI_COMPATIBLE_BACKENDS={"vllm"},
                 )
                 load_defs(
@@ -1420,6 +1425,7 @@ class CollectorTests(unittest.TestCase):
                 lora_request=None,
                 cache_salt=None,
                 r1_shadow_lengths=None,
+                r1_request_type=None,
             )
             native = N["Request"].from_engine_core_request(engine_request)
             self.assertEqual(native.request_id, row["engine_request_id"])
@@ -1728,13 +1734,24 @@ class CollectorTests(unittest.TestCase):
             ).stdout
             current = (ROOT / path).read_text("utf-8")
             if path == "vllm/v1/engine/__init__.py":
+                current_classes = {n.name: n for n in ast.parse(current).body
+                                   if isinstance(n, ast.ClassDef)}
+                for class_name, required in {
+                    "EngineCoreRequest": {"r1_shadow_lengths", "r1_request_type", "r1_type_slo_instance"},
+                    "EngineCoreOutput": {"r1_error"},
+                }.items():
+                    fields = {getattr(n.target, "id", None) for n in current_classes[class_name].body
+                              if isinstance(n, ast.AnnAssign)}
+                    self.assertTrue(required <= fields)
                 def original_schema(text):
                     tree = ast.parse(text)
+                    allowed = {"EngineCoreRequest": {"r1_shadow_lengths", "r1_request_type", "r1_type_slo_instance"},
+                               "EngineCoreOutput": {"r1_error"}}
                     for node in tree.body:
-                        if isinstance(node, ast.ClassDef) and node.name == "EngineCoreRequest":
+                        if isinstance(node, ast.ClassDef) and node.name in allowed:
                             node.body = [n for n in node.body if not (
                                 isinstance(n, ast.AnnAssign) and
-                                getattr(n.target, "id", None) == "r1_shadow_lengths")]
+                                getattr(n.target, "id", None) in allowed[node.name])]
                     return ast.dump(tree)
                 self.assertEqual(original_schema(current), original_schema(original))
             elif names is None:

@@ -58,6 +58,10 @@ def add_mixed_dataset_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional JSON inspection manifest, written before sending requests.",
     )
+    group.add_argument("--mixed-approved-manifest", default=None,
+                       help="Replay a checked R1 candidate manifest and split.")
+    group.add_argument("--mixed-approved-split", choices=("train", "calibration", "test"),
+                       default=None, help="Approved manifest split to replay.")
 
 
 def mixed_dataset_from_args(args: argparse.Namespace) -> "MixedWorkloadDataset":
