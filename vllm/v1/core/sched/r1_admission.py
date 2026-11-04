@@ -452,6 +452,32 @@ class AdmissionController:
         comparable = sum(len(group) for group in by_type.values())
         has_pair = any(len(group) >= 2 for group in by_type.values())
         differs = any(len(group) >= 2 and min(group) != max(group) for group in by_type.values())
+
+        # Reference ordering is observation only: never apply it to waiting.
+        sort_start = time.perf_counter_ns()
+        scanned = frame["prefix_stop"] != "not_scanned"
+        eligible_rows = [row for row in rows if row["reference_slack_s"] is not None]
+        ordered_rows = sorted(eligible_rows,
+                              key=lambda row: (row["reference_slack_s"], row["position"]))
+        original_ids = [row["request_id"] for row in rows] if scanned else None
+        comparable_ids = [row["request_id"] for row in eligible_rows] if scanned else None
+        reference_ids = [row["request_id"] for row in ordered_rows] if scanned else None
+        unavailable = ([{"request_id": row["request_id"], "position": row["position"],
+                         "reason": (row["missing_reason"] or "chat_e2e_reference_not_estimable")}
+                        for row in rows if row["reference_slack_s"] is None]
+                       if scanned else None)
+        if not scanned:
+            reference_status, comparison_reason = "unscanned", "candidates_not_scanned"
+        elif not rows:
+            reference_status, comparison_reason = "empty", "fewer_than_two_candidates"
+        else:
+            reference_status = "partial" if unavailable else "complete"
+            comparison_reason = ("fewer_than_two_candidates" if len(rows) < 2 else
+                                 "fewer_than_two_comparable" if len(eligible_rows) < 2 else
+                                 "partial_candidate_set" if unavailable else None)
+        reference_changed = (reference_ids != original_ids
+                             if reference_status == "complete" and len(rows) >= 2 else None)
+        reference_sort_ns = time.perf_counter_ns() - sort_start
         return {"schema_version": 1, "candidate_source": "admission_contiguous_prefix",
                 "scheduler_timestamp_s": timestamp,
                 "config_run_id": config.get("run_id") if config else None,
@@ -464,6 +490,15 @@ class AdmissionController:
                 "comparable_count": (None if frame["prefix_stop"] == "not_scanned" else comparable),
                 "same_type_comparable_pair": (None if frame["prefix_stop"] == "not_scanned" else has_pair),
                 "same_type_reference_differs": differs if has_pair else None,
+                "reference_order_status": reference_status,
+                "reference_order_original_ids": original_ids,
+                "reference_order_comparable_ids": comparable_ids,
+                "reference_order_subset_ids": reference_ids,
+                "reference_order_unavailable": unavailable,
+                "reference_comparison_reason": comparison_reason,
+                "reference_order_changed": reference_changed,
+                "reference_sort_ns": reference_sort_ns,
+                "reference_sort_timing_version": 1,
                 "available_running_slots": frame["available_running_slots"],
                 "token_budget": frame["token_budget"], "opportunity_id": frame["opportunity_id"],
                 "reason": frame["reason"], "prefix_stop": frame["prefix_stop"],

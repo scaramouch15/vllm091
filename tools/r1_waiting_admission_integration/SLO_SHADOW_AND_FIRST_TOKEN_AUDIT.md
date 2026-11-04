@@ -40,8 +40,11 @@ components compared with the numerical client SLO, not client E2E predictions;
 negative is not proven violation and positive is not a guarantee. P90
 coverage is empirical, not guaranteed. Chat logs both SLOs and marks TTFT and
 TPOT risk `not_estimable`. Comparable pairs and differing reference values are
-reported only within the same code/summary type, without defining a cross-type
-formula. Preempted/already-admitted requests truncate the prefix; no resumed
+reported in the existing `same_type_*` fields within the same code/summary type.
+The separately logged reference order below compares code and summary using
+seconds of the same server-observed reference-slack definition; it is a bounded
+mechanism observation, not a final cross-type scheduling formula.
+Preempted/already-admitted requests truncate the prefix; no resumed
 request is interpreted as a first-admission prediction.
 
 `slo_construct_ns` measures bounded construction only and is included inside
@@ -157,3 +160,46 @@ an offline CPU comparison using both artifacts.
 For an unscanned frame, `candidate_count`, `comparable_count` and
 `same_type_comparable_pair` are null: no candidate enumeration was performed.
 They cannot be counted as zero or as evidence that no pair existed.
+
+
+## Reference order (observe only)
+
+When `VLLM_R1_SLO_SHADOW=1`, the same event additionally records a stable
+ascending ordering of the existing `reference_slack_s` values for comparable
+code and summary candidates. Negative values are retained; ties use original
+prefix position. No waiting queue operation or additional model inference is
+performed. The predictor itself still has no real type feature; the Scheduler
+uses the received type only to select the configured E2EL SLO. First QUEUED is
+a Core enqueue timestamp after frontend reception and processing, not the
+server's initial HTTP receipt. The existing SLO values are client E2EL
+thresholds; the calculated wait plus inference estimate omits network and other
+client/frontend time and is not client E2EL, a violation probability or a
+meeting guarantee. The P90 prediction may be wrong or miscalibrated.
+
+The new additive `slo_shadow_v1` fields are:
+
+- `reference_order_status`: `unscanned`, `empty`, `partial`, or `complete`.
+- `reference_order_original_ids`: all prefix candidate IDs in queue order, or
+  null if unscanned; an empty prefix is an empty list.
+- `reference_order_comparable_ids`: only candidates with valid reference
+  slack, in original order; `reference_order_subset_ids` is their stable
+  reference order. A partial subset is never a full candidate ordering.
+- `reference_order_unavailable`: request ID, original position and reason for
+  each excluded candidate. Chat remains unable to estimate TTFT/TPOT risk.
+- `reference_comparison_reason`: `candidates_not_scanned`,
+  `fewer_than_two_candidates`, `fewer_than_two_comparable`,
+  `partial_candidate_set`, or null for a full comparison.
+- `reference_order_changed`: Boolean only when all candidates are comparable
+  and at least two exist, otherwise null. It describes a computed order, not an
+  actual admission difference.
+- `reference_sort_ns` and `reference_sort_timing_version=1`: time for subset
+  filtering, stable sort and ordering metadata, including timer overhead; this
+  interval is nested within `slo_construct_ns`, itself inside the admission
+  log and schedule foreground intervals. Do not add these intervals or their
+  quantiles.
+
+No new feature switch is introduced: the existing SLO shadow switch defaults to
+off and requires admission observe mode. Every/prefix limit and all native
+resource checks retain their existing semantics. Results exclude candidates
+outside the selected prefix and do not imply a scheduling benefit or Goodput
+improvement. Missing/failed observations are not reused across rounds.
