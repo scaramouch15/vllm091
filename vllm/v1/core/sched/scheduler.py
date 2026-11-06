@@ -203,6 +203,10 @@ class Scheduler(SchedulerInterface):
                     admission_config.head_policy.startswith("conditional_") and not self.log_stats):
                 raise ValueError("conditional head policy requires native log_stats")
         self.r1_shadow = None
+        if (os.environ.get("VLLM_R1_SHADOW", "0") == "0" and
+                (os.environ.get("VLLM_R1_PREFILL_SHADOW", "0") != "0" or
+                 os.environ.get("VLLM_R1_PREFILL_TIMING", "0") != "0")):
+            raise ValueError("prefill observation requires VLLM_R1_SHADOW=1")
         if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
             from vllm.v1.metrics.r1_shadow import create_shadow
             self.r1_shadow = create_shadow(vllm_config, "core")
@@ -222,6 +226,20 @@ class Scheduler(SchedulerInterface):
     def schedule(self) -> SchedulerOutput:
         admission = getattr(self, "r1_admission", None)
         if admission is None:
+            shadow = getattr(self, "r1_shadow", None)
+            if getattr(getattr(shadow, "config", None), "schedule_timing", False):
+                started = time.perf_counter_ns()
+                outcome = "failed"
+                try:
+                    result = self._schedule()
+                    outcome = "success"
+                    return result
+                finally:
+                    try:
+                        shadow.observe_elapsed("schedule_wall_v1", started, outcome)
+                    except Exception as exc:
+                        logger.error("R1 schedule timing bookkeeping failed (%s)",
+                                     type(exc).__name__)
             return self._schedule()
         started = time.perf_counter_ns()
         frame = admission.begin()

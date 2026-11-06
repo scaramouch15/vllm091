@@ -22,6 +22,8 @@ from itertools import islice
 from pathlib import Path
 
 MODEL_SHA256 = "23aff057712e7bec05db91d470af39a1b34eabddbf5852914710e1b8e4b96e1f"
+PREFILL_SHA256 = "4ab94aa14148645ab06dab7d7adfc49a882836b5305e96657d37b075863c021c"
+PREFILL_FIELDS = ["num_prompt_tokens", "running_count", "kv_usage"]
 INTERNAL_KEY = "_vllm_r1_shadow_static_v1"
 QUANTILES = [0.5, 0.9, 0.95]
 SORT_RULE = "p90_ascending_stable_v1"
@@ -124,11 +126,18 @@ class ShadowConfig:
     scan_limit: int = 128
     every: int = 8
     sort: bool = False
+    prefill_model: Path | None = None
+    schedule_timing: bool = False
 
     @classmethod
     def from_env(cls):
+        prefill = os.environ.get("VLLM_R1_PREFILL_SHADOW", "0")
+        timing = os.environ.get("VLLM_R1_PREFILL_TIMING", "0")
+        require(prefill in ("0", "1") and timing in ("0", "1"),
+                "PREFILL_SHADOW and PREFILL_TIMING must be 0 or 1")
         enabled = os.environ.get("VLLM_R1_SHADOW", "0")
         if enabled == "0":
+            require(prefill == "0" and timing == "0", "prefill observation requires SHADOW=1")
             return None
         require(enabled == "1", "VLLM_R1_SHADOW must be 0 or 1")
         model = os.environ.get("VLLM_R1_SHADOW_MODEL", "")
@@ -141,12 +150,18 @@ class ShadowConfig:
         scan = int(os.environ.get("VLLM_R1_SHADOW_SCAN_LIMIT", "128"))
         every = int(os.environ.get("VLLM_R1_SHADOW_EVERY", "8"))
         sort = os.environ.get("VLLM_R1_SHADOW_SORT", "0")
+        require((prefill == "0" and timing == "0") or
+                os.environ.get("VLLM_R1_ADMISSION_MODE", "off") == "off",
+                "prefill observation requires ADMISSION_MODE=off")
+        prefill_path = os.environ.get("VLLM_R1_PREFILL_MODEL", "")
+        require(prefill == "0" or bool(prefill_path), "PREFILL_MODEL is required")
         require(sort in ("0", "1"), "VLLM_R1_SHADOW_SORT must be 0 or 1")
         require(1 <= cap <= scan <= 4096 and every > 0,
                 "require 1 <= candidates <= scan_limit <= 4096, every > 0")
         return cls(Path(model).expanduser().resolve(), run,
                    Path(directory).expanduser().resolve(), cap, scan, every,
-                   sort == "1")
+                   sort == "1", Path(prefill_path).expanduser().resolve() if prefill == "1" else None,
+                   timing == "1")
 
 
 @dataclass(frozen=True)
@@ -306,9 +321,38 @@ class Predictor:
         return result.tolist()
 
 
+class PrefillPredictor:
+    """The hash pins the audited artifact and its first-schedule-to-token seconds target."""
+    def __init__(self, path):
+        require(hashlib.sha256(path.read_bytes()).hexdigest() == PREFILL_SHA256,
+                "prefill model SHA256 mismatch")
+        import joblib
+        import numpy as np
+        artifact = joblib.load(path)
+        require(isinstance(artifact, dict) and artifact.get("features") == PREFILL_FIELDS
+                and artifact.get("quantiles") == QUANTILES
+                and isinstance(artifact.get("models"), (list, tuple))
+                and len(artifact["models"]) == 3,
+                "prefill feature order or quantile schema mismatch")
+        require(all(getattr(m, "n_features_in_", None) == len(PREFILL_FIELDS)
+                    and callable(getattr(m, "predict", None)) for m in artifact["models"]),
+                "prefill estimator feature schema mismatch")
+        self.np = np
+        self.models = artifact["models"]
+
+    def predict(self, candidates, running_count, kv_usage):
+        matrix = self.np.asarray([[r.num_prompt_tokens, running_count, kv_usage]
+                                  for r in candidates], dtype=self.np.float64)
+        raw = self.np.column_stack([m.predict(matrix) for m in self.models])
+        require(raw.shape == (len(candidates), 3) and self.np.isfinite(raw).all(),
+                "invalid prefill prediction")
+        return self.np.sort(self.np.maximum(raw, 0), axis=1).tolist()
+
+
 class Shadow:
-    def __init__(self, config, predictor, writer):
+    def __init__(self, config, predictor, writer, prefill_predictor=None):
         self.config, self.predictor, self.writer = config, predictor, writer
+        self.prefill_predictor = prefill_predictor
         self.counts = Counter()
         for outcome in ("success", "failed", "empty", "interval_skip"):
             self.counts["dynamic_outcome_" + outcome] = 0
@@ -502,6 +546,14 @@ class Shadow:
                 "state_read_ns": state_read - start,
                 "time_head_ns": predicted - assembled,
                 "shadow_compute_ns": time.perf_counter_ns() - start})
+            if self.prefill_predictor is not None:
+                try:
+                    self.observe_prefill(snapshot, candidates, running_count, kv_usage)
+                except Exception as exc:
+                    # Measurement/bookkeeping itself must not replace B's decision.
+                    self.counts["prefill_instrumentation_errors"] += 1
+                    logger.error("R1 prefill observation bookkeeping failed (%s)",
+                                 type(exc).__name__)
             if self.config.sort:
                 self.sort_candidates(snapshot, candidates, predictions)
             return snapshot, tuple(r.request_id for r in candidates)
@@ -518,6 +570,34 @@ class Shadow:
             count = None if outcome == "interval_skip" else len(candidates)
             self.observe_elapsed("dynamic_foreground", start, outcome, count,
                                  total_counter="shadow_total_ns")
+
+    def observe_prefill(self, snapshot, candidates, running_count, kv_usage):
+        """Supplement the same sweep without changing its B result or queue."""
+        start = time.perf_counter_ns()
+        self.counts["prefill_calls"] += 1
+        try:
+            values = self.prefill_predictor.predict(candidates, running_count, kv_usage)
+            require(len(values) == len(candidates), "prefill batch length mismatch")
+            require(all(len(v) == 3 and all(type(x) in (int, float) and
+                    math.isfinite(x) and x >= 0 for x in v) and v == sorted(v)
+                    for v in values), "invalid prefill quantiles")
+            prediction_ns = time.perf_counter_ns() - start
+            self.counts["prefill_success"] += 1
+            self.emit("shadow_prefill_v1", {
+                "decision_batch_id": snapshot["decision_batch_id"],
+                "prefill_model_sha256": PREFILL_SHA256,
+                "candidate_source": "shadow_sweep_skip_ineligible",
+                "candidate_count": len(candidates), "prediction_ns": prediction_ns,
+                "target": "first_scheduled_to_first_token_batch_seconds",
+                "candidates": [{"engine_request_id": r.request_id, "quantiles_s": tuple(q)}
+                               for r, q in zip(candidates, values)]})
+        except Exception as exc:
+            self.counts["prefill_errors"] += 1
+            self.emit("shadow_prefill_error_v1", {
+                "decision_batch_id": snapshot["decision_batch_id"],
+                "candidate_count": len(candidates), "error_type": type(exc).__name__})
+        finally:
+            self.observe_elapsed("prefill_foreground_v1", start, "complete", len(candidates))
 
     def sort_candidates(self, snapshot, candidates, predictions):
         """Record a separate ordering; failures do not change prediction success."""
@@ -611,6 +691,8 @@ def create_shadow(vllm_config, role):
     start = time.perf_counter_ns()
     validate_service(vllm_config)
     predictor = Predictor(config.model, role)
+    prefill_predictor = (PrefillPredictor(config.prefill_model)
+                         if role == "core" and config.prefill_model is not None else None)
     # Import/reuse only after enabled; collector switch / ID policy is irrelevant.
     from vllm.v1.metrics.request_collector import CollectionConfig, RecordWriter
     writer = RecordWriter(CollectionConfig(config.run_id, config.directory),
@@ -623,8 +705,11 @@ def create_shadow(vllm_config, role):
             "quantiles": QUANTILES, "max_tokens": 2048,
             "candidates": config.candidates, "scan_limit": config.scan_limit,
             "every": config.every, "threadpools": predictor.threadpools,
+            "prefill_enabled": config.prefill_model is not None,
+            "prefill_model_sha256": PREFILL_SHA256 if config.prefill_model is not None else None,
+            "prefill_schedule_timing": config.schedule_timing,
             "shadow_sort_enabled": config.sort, "shadow_sort_rule": SORT_RULE,
             "shadow_sort_timing_version": SORT_TIMING_VERSION,
             "environment": predictor.environment,
             "startup_load_ns": time.perf_counter_ns() - start})
-    return Shadow(config, predictor, writer)
+    return Shadow(config, predictor, writer, prefill_predictor)
