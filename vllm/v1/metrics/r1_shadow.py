@@ -157,8 +157,12 @@ class ShadowConfig:
         scan = int(os.environ.get("VLLM_R1_SHADOW_SCAN_LIMIT", "128"))
         every = int(os.environ.get("VLLM_R1_SHADOW_EVERY", "8"))
         sort = os.environ.get("VLLM_R1_SHADOW_SORT", "0")
+        admission_mode = os.environ.get("VLLM_R1_ADMISSION_MODE", "off")
+        type_admission = (admission_mode in ("observe", "apply") and
+                          os.environ.get("VLLM_R1_ADMISSION_HEAD_POLICY") == "type_slo" and
+                          type_rank == "1")
         require((prefill == "0" and timing == "0") or
-                os.environ.get("VLLM_R1_ADMISSION_MODE", "off") == "off",
+                admission_mode == "off" or type_admission,
                 "prefill observation requires ADMISSION_MODE=off")
         prefill_path = os.environ.get("VLLM_R1_PREFILL_MODEL", "")
         require(prefill == "0" or bool(prefill_path), "PREFILL_MODEL is required")
@@ -612,7 +616,8 @@ class Shadow:
             self.observe_elapsed("dynamic_foreground", start, outcome, count,
                                  total_counter="shadow_total_ns")
 
-    def observe_prefill(self, snapshot, candidates, running_count, kv_usage):
+    def observe_prefill(self, snapshot, candidates, running_count, kv_usage,
+                        candidate_source="shadow_sweep_skip_ineligible"):
         """Supplement the same sweep without changing its B result or queue."""
         start = time.perf_counter_ns()
         self.counts["prefill_calls"] += 1
@@ -627,7 +632,7 @@ class Shadow:
             self.emit("shadow_prefill_v1", {
                 "decision_batch_id": snapshot["decision_batch_id"],
                 "prefill_model_sha256": self.prefill_predictor.sha256,
-                "candidate_source": "shadow_sweep_skip_ineligible",
+                "candidate_source": candidate_source,
                 "candidate_count": len(candidates), "prediction_ns": prediction_ns,
                 "target": PREFILL_TARGET,
                 "target_source": "operator_attested_training_provenance",
@@ -643,7 +648,8 @@ class Shadow:
         finally:
             self.observe_elapsed("prefill_foreground_v1", start, "complete", len(candidates))
 
-    def observe_type_rank(self, snapshot, candidates, predictions, prefill_values, type_slo):
+    def observe_type_rank(self, snapshot, candidates, predictions, prefill_values, type_slo,
+                          candidate_source="shadow_sweep_skip_ineligible"):
         """Describe a bounded sweep only; missing scores never become a full ranking."""
         started = time.perf_counter_ns()
         rows = []
@@ -688,7 +694,7 @@ class Shadow:
         ranked = [r["request_id"] for r in ordered]
         elapsed = time.perf_counter_ns() - started
         self.emit("shadow_type_rank_v1", {"decision_batch_id": snapshot["decision_batch_id"],
-                  "candidate_source": "shadow_sweep_skip_ineligible", "candidate_count": len(rows),
+                  "candidate_source": candidate_source, "candidate_count": len(rows),
                   "config_sha256": type_slo.get("config_sha256") if isinstance(type_slo, dict) else None,
                   "config_run_id": type_slo.get("run_id") if isinstance(type_slo, dict) else None,
                   "scheduled_timestamp_s": timestamp, "running_count": snapshot["running_count"],
@@ -701,6 +707,7 @@ class Shadow:
                   "itl_status": "unavailable_in_scheduler", "candidates": rows,
                   "compute_ns": elapsed})
         self.observe_elapsed("type_rank_foreground_v1", started, "complete", len(rows))
+        return rows, ordered
 
     def sort_candidates(self, snapshot, candidates, predictions):
         """Record a separate ordering; failures do not change prediction success."""

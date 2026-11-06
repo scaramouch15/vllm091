@@ -189,7 +189,8 @@ class Scheduler(SchedulerInterface):
             self.r1_type_slo = ExperimentState()
         self.r1_admission_mode = os.environ.get("VLLM_R1_ADMISSION_MODE", "off")
         if (os.environ.get("VLLM_R1_TYPE_RANK_SHADOW", "0") == "1" and
-                self.r1_admission_mode != "off"):
+                self.r1_admission_mode != "off" and
+                os.environ.get("VLLM_R1_ADMISSION_HEAD_POLICY") != "type_slo"):
             raise ValueError("R1 type rank shadow requires ADMISSION_MODE=off")
         self.r1_admission = None
         admission_config = None
@@ -205,6 +206,13 @@ class Scheduler(SchedulerInterface):
             if (admission_config.mode in ("observe", "apply") and
                     admission_config.head_policy.startswith("conditional_") and not self.log_stats):
                 raise ValueError("conditional head policy requires native log_stats")
+            if (admission_config.mode in ("observe", "apply") and
+                    admission_config.head_policy == "type_slo" and
+                    (not self.log_stats or not self.r1_type_slo_enabled or
+                     os.environ.get("VLLM_R1_TYPE_RANK_SHADOW") != "1" or
+                     os.environ.get("VLLM_R1_PREFILL_SHADOW") != "1" or
+                     os.environ.get("VLLM_R1_SHADOW") != "1")):
+                raise ValueError("type_slo requires native log_stats, type SLO, shadow ranking and prefill")
         self.r1_shadow = None
         if (os.environ.get("VLLM_R1_SHADOW", "0") == "0" and
                 (os.environ.get("VLLM_R1_PREFILL_SHADOW", "0") != "0" or

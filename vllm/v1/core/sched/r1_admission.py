@@ -23,10 +23,12 @@ class AdmissionConfig:
     def __post_init__(self):
         if self.slo_observation and self.mode != "observe":
             raise ValueError("SLO shadow observation requires admission mode observe")
-        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk"):
+        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk", "type_slo"):
             raise ValueError("invalid VLLM_R1_ADMISSION_HEAD_POLICY")
         if self.mode in ("observe", "apply") and self.head_policy != "protected" and self.skip_single_slot:
             raise ValueError("ranked or conditional head policy conflicts with SKIP_SINGLE_SLOT=1")
+        if self.mode in ("observe", "apply") and self.head_policy == "type_slo" and not self.time_observation:
+            raise ValueError("type_slo requires TIME_OBSERVE=1")
         if self.mode in ("observe", "apply") and self.head_policy.startswith("conditional_"):
             if not self.time_observation:
                 raise ValueError("conditional head policy requires TIME_OBSERVE=1")
@@ -145,6 +147,10 @@ class AdmissionController:
                          budget_seconds=self.config.budget_seconds, wait_due=None,
                          risk_due=None, selected_policy=None, condition_fallback=None,
                          condition_check_ns=0, head_adjust_ns=0, condition_timing_version=2)
+        if self.config.head_policy == "type_slo":
+            frame.update(score_rule="type_slo_normalized_p90_wait_protection_v1",
+                         type_rank_candidates=(), type_rank_ns=0,
+                         type_prefill_ns=0, type_fallback=None)
         return frame
 
     def eligible(self, r):
@@ -287,6 +293,45 @@ class AdmissionController:
             frame["error_type"] = type(exc).__name__
             return None
         frame["prediction_ns"] = time.perf_counter_ns() - started
+        type_order = None
+        if self.config.head_policy == "type_slo":
+            started = time.perf_counter_ns()
+            try:
+                state = getattr(scheduler, "r1_type_slo", None)
+                config = state.snapshot() if state is not None else None
+                if config is None:
+                    raise ValueError("slo_config_unavailable")
+                snapshot = {"decision_batch_id": f"{self.instance_id}:{frame['schedule_id']}",
+                            "scheduled_timestamp": timestamp, "running_count": running_count,
+                            "kv_usage": kv_usage, "token_budget": int(token_budget)}
+                try:
+                    prefill = self.shadow.observe_prefill(snapshot, candidates, running_count, kv_usage,
+                                                          candidate_source="admission_contiguous_prefix")
+                finally:
+                    frame["type_prefill_ns"] = time.perf_counter_ns() - started
+                if prefill is None:
+                    raise ValueError("prefill_prediction_failed")
+                started = time.perf_counter_ns()
+                try:
+                    rows, ordered_rows = self.shadow.observe_type_rank(
+                        snapshot, candidates, [(s, s, s) for s in decision.scores], prefill, config,
+                        candidate_source="admission_contiguous_prefix")
+                finally:
+                    frame["type_rank_ns"] = time.perf_counter_ns() - started
+                frame["type_rank_candidates"] = rows
+                if len(rows) != len(candidates) or any(row["missing_reason"] for row in rows):
+                    frame["type_fallback"] = "incomplete_candidate_information"
+                    frame["reason"] = "type_information_unavailable"
+                    frame["type_rank_ns"] = time.perf_counter_ns() - started
+                    return None
+                type_order = [row["position"] for row in ordered_rows]
+                if sorted(type_order) != list(range(len(candidates))):
+                    raise ValueError("invalid_type_order")
+                frame["type_rank_ns"] = time.perf_counter_ns() - started
+            except Exception as exc:
+                frame["type_fallback"] = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+                frame["reason"] = "type_prediction_or_decision_failed"
+                return None
         self.prediction_successes += 1
         started = time.perf_counter_ns()
         try:
@@ -301,7 +346,9 @@ class AdmissionController:
                     or len(actual) != len(candidates)
                     or any(a is not b for a, b in zip(actual, candidates))):
                 raise ValueError("decision identity or prefix mismatch")
-            if self.config.head_policy == "protected":
+            if self.config.head_policy == "type_slo":
+                order = type_order
+            elif self.config.head_policy == "protected":
                 order = [0, *sorted(range(1, len(ids)), key=lambda i: (decision.scores[i], i))]
             else:
                 order = sorted(range(len(ids)), key=lambda i: (decision.scores[i], i))
@@ -512,6 +559,10 @@ class AdmissionController:
         frame["tail_A"] = frame["tail_attempt_count"]
         frame["tail_M"] = len(frame["tail_admitted"])
         frame["actual_admission_order"] = frame["window_admitted"] + frame["tail_admitted"]
+        if self.config.head_policy == "type_slo":
+            positions = {request_id: index for index, request_id in enumerate(frame["candidate_ids"])}
+            admitted_positions = [positions[rid] for rid in frame["window_admitted"]]
+            frame["actual_window_order_changed"] = admitted_positions != sorted(admitted_positions)
         if self.config.slo_observation:
             slo_start = time.perf_counter_ns()
             try:
