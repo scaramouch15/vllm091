@@ -188,6 +188,9 @@ class Scheduler(SchedulerInterface):
             from vllm.v1.core.sched.r1_type_slo_state import ExperimentState
             self.r1_type_slo = ExperimentState()
         self.r1_admission_mode = os.environ.get("VLLM_R1_ADMISSION_MODE", "off")
+        if (os.environ.get("VLLM_R1_TYPE_RANK_SHADOW", "0") == "1" and
+                self.r1_admission_mode != "off"):
+            raise ValueError("R1 type rank shadow requires ADMISSION_MODE=off")
         self.r1_admission = None
         admission_config = None
         if (self.r1_admission_mode != "off" or
@@ -205,11 +208,15 @@ class Scheduler(SchedulerInterface):
         self.r1_shadow = None
         if (os.environ.get("VLLM_R1_SHADOW", "0") == "0" and
                 (os.environ.get("VLLM_R1_PREFILL_SHADOW", "0") != "0" or
-                 os.environ.get("VLLM_R1_PREFILL_TIMING", "0") != "0")):
+                 os.environ.get("VLLM_R1_PREFILL_TIMING", "0") != "0" or
+                 os.environ.get("VLLM_R1_TYPE_RANK_SHADOW", "0") != "0")):
             raise ValueError("prefill observation requires VLLM_R1_SHADOW=1")
         if os.environ.get("VLLM_R1_SHADOW", "0") != "0":
             from vllm.v1.metrics.r1_shadow import create_shadow
             self.r1_shadow = create_shadow(vllm_config, "core")
+            if (self.r1_shadow is not None and self.r1_shadow.config.type_rank_shadow
+                    and not self.log_stats):
+                raise ValueError("R1 type rank shadow requires native log_stats")
         if admission_config is not None and admission_config.mode != "off":
             from vllm.v1.core.sched.r1_admission import (AdmissionController,
                                                         unsupported_reason)
@@ -429,10 +436,14 @@ class Scheduler(SchedulerInterface):
                 and shadow is not None and not preempted_reqs and self.waiting
                 and token_budget > 0
                 and len(self.running) < self.max_num_running_reqs):
-            shadow_decision = shadow.sweep(
-                self.waiting, self.running, self.kv_cache_manager,
-                token_budget, scheduled_timestamp,
-                getattr(admission_snapshot, "decision_batch_id", None))
+            shadow_args = (self.waiting, self.running, self.kv_cache_manager,
+                           token_budget, scheduled_timestamp,
+                           getattr(admission_snapshot, "decision_batch_id", None))
+            if getattr(shadow.config, "type_rank_shadow", False):
+                state = getattr(self, "r1_type_slo", None)
+                shadow_decision = shadow.sweep(*shadow_args, type_slo=state.snapshot() if state else None)
+            else:
+                shadow_decision = shadow.sweep(*shadow_args)
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1019,9 +1030,11 @@ class Scheduler(SchedulerInterface):
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
-            if (getattr(self, "r1_admission", None) is not None and
+            if ((getattr(self, "r1_admission", None) is not None and
                     (self.r1_admission.config.time_observation or
-                     self.r1_admission.config.slo_observation)):
+                     self.r1_admission.config.slo_observation)) or
+                    getattr(getattr(getattr(self, "r1_shadow", None), "config", None),
+                            "type_rank_shadow", False)):
                 request.r1_first_queued_timestamp = request.events[-1].timestamp
 
     def finish_requests(

@@ -131,6 +131,8 @@ class ShadowConfig:
     schedule_timing: bool = False
     prefill_sha256: str | None = None
     prefill_provenance: str | None = None
+    type_rank_shadow: bool = False
+    type_rank_wait_limit: float = 30.0
 
     @classmethod
     def from_env(cls):
@@ -139,8 +141,10 @@ class ShadowConfig:
         require(prefill in ("0", "1") and timing in ("0", "1"),
                 "PREFILL_SHADOW and PREFILL_TIMING must be 0 or 1")
         enabled = os.environ.get("VLLM_R1_SHADOW", "0")
+        type_rank = os.environ.get("VLLM_R1_TYPE_RANK_SHADOW", "0")
+        require(type_rank in ("0", "1"), "TYPE_RANK_SHADOW must be 0 or 1")
         if enabled == "0":
-            require(prefill == "0" and timing == "0", "prefill observation requires SHADOW=1")
+            require(prefill == "0" and timing == "0" and type_rank == "0", "prefill/type observation requires SHADOW=1")
             return None
         require(enabled == "1", "VLLM_R1_SHADOW must be 0 or 1")
         model = os.environ.get("VLLM_R1_SHADOW_MODEL", "")
@@ -165,6 +169,16 @@ class ShadowConfig:
                     "PREFILL_MODEL_SHA256 must be an explicit 64-digit hexadecimal SHA256")
             require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", provenance) is not None,
                     "PREFILL_PROVENANCE must be an explicit safe provenance identifier")
+        wait_limit = 30.0
+        if type_rank == "1":
+            require(prefill == "1" and os.environ.get("VLLM_R1_TYPE_SLO", "0") == "1",
+                    "TYPE_RANK_SHADOW requires prefill and TYPE_SLO")
+            try:
+                wait_limit = float(os.environ.get("VLLM_R1_TYPE_RANK_WAIT_LIMIT_SECONDS", "30"))
+            except ValueError as exc:
+                raise ValueError("R1 shadow: invalid TYPE_RANK_WAIT_LIMIT_SECONDS") from exc
+            require(math.isfinite(wait_limit) and wait_limit > 0,
+                    "TYPE_RANK_WAIT_LIMIT_SECONDS must be finite and positive")
         require(sort in ("0", "1"), "VLLM_R1_SHADOW_SORT must be 0 or 1")
         require(1 <= cap <= scan <= 4096 and every > 0,
                 "require 1 <= candidates <= scan_limit <= 4096, every > 0")
@@ -172,7 +186,7 @@ class ShadowConfig:
                    Path(directory).expanduser().resolve(), cap, scan, every,
                    sort == "1", Path(prefill_path).expanduser().resolve() if prefill == "1" else None,
                    timing == "1", expected_sha.lower() if prefill == "1" else None,
-                   provenance if prefill == "1" else None)
+                   provenance if prefill == "1" else None, type_rank == "1", wait_limit)
 
 
 @dataclass(frozen=True)
@@ -497,7 +511,7 @@ class Shadow:
                                  total_counter="static_total_ns")
 
     def sweep(self, waiting, running, kv_manager, token_budget,
-              scheduled_timestamp, decision_batch_id=None):
+              scheduled_timestamp, decision_batch_id=None, type_slo=None):
         """Read-only bounded traversal; never allocate KV or reorder either queue."""
         start = time.perf_counter_ns()
         self.batch += 1
@@ -566,14 +580,21 @@ class Shadow:
                 "state_read_ns": state_read - start,
                 "time_head_ns": predicted - assembled,
                 "shadow_compute_ns": time.perf_counter_ns() - start})
+            prefill_values = None
             if self.prefill_predictor is not None:
                 try:
-                    self.observe_prefill(snapshot, candidates, running_count, kv_usage)
+                    prefill_values = self.observe_prefill(snapshot, candidates, running_count, kv_usage)
                 except Exception as exc:
                     # Measurement/bookkeeping itself must not replace B's decision.
                     self.counts["prefill_instrumentation_errors"] += 1
                     logger.error("R1 prefill observation bookkeeping failed (%s)",
                                  type(exc).__name__)
+            if self.config.type_rank_shadow:
+                try:
+                    self.observe_type_rank(snapshot, candidates, predictions, prefill_values, type_slo)
+                except Exception as exc:
+                    self.counts["type_rank_errors"] += 1
+                    self.emit("shadow_type_rank_error_v1", {"decision_batch_id": snapshot["decision_batch_id"], "error_type": type(exc).__name__})
             if self.config.sort:
                 self.sort_candidates(snapshot, candidates, predictions)
             return snapshot, tuple(r.request_id for r in candidates)
@@ -613,6 +634,7 @@ class Shadow:
                 "provenance_id": self.config.prefill_provenance,
                 "candidates": [{"engine_request_id": r.request_id, "quantiles_s": tuple(q)}
                                for r, q in zip(candidates, values)]})
+            return values
         except Exception as exc:
             self.counts["prefill_errors"] += 1
             self.emit("shadow_prefill_error_v1", {
@@ -620,6 +642,65 @@ class Shadow:
                 "candidate_count": len(candidates), "error_type": type(exc).__name__})
         finally:
             self.observe_elapsed("prefill_foreground_v1", start, "complete", len(candidates))
+
+    def observe_type_rank(self, snapshot, candidates, predictions, prefill_values, type_slo):
+        """Describe a bounded sweep only; missing scores never become a full ranking."""
+        started = time.perf_counter_ns()
+        rows = []
+        config = type_slo.get("config_seconds", {}) if isinstance(type_slo, dict) else {}
+        timestamp = snapshot["scheduled_timestamp"]
+        for i, req in enumerate(candidates):
+            kind = getattr(req, "r1_request_type", None)
+            queued = getattr(req, "r1_first_queued_timestamp", None)
+            reason = None
+            wait = None
+            if kind not in ("chat", "code", "summary"):
+                reason = "type_missing_or_invalid"
+            elif not config:
+                reason = "slo_config_unavailable"
+            elif (type(queued) not in (int, float) or not math.isfinite(queued) or
+                  type(timestamp) not in (int, float) or not math.isfinite(timestamp) or queued > timestamp):
+                reason = "queued_time_missing_or_invalid"
+            else:
+                wait = timestamp - queued
+            slo = config.get("chat.ttft" if kind == "chat" else str(kind) + ".e2el")
+            if reason is None and (type(slo) not in (int, float) or not math.isfinite(slo) or slo <= 0):
+                reason = "slo_missing_or_invalid"
+            pred = ((prefill_values[i][1] if prefill_values is not None else None) if kind == "chat"
+                    else predictions[i][1] if kind in ("code", "summary") else None)
+            if reason is None and pred is None:
+                reason = "prefill_prediction_unavailable"
+            score = None if reason else (slo - wait - pred) / slo
+            if score is not None and not math.isfinite(score):
+                score, reason = None, "score_nonfinite"
+            protected = None if wait is None else wait >= self.config.type_rank_wait_limit
+            rows.append({"request_id": req.request_id, "position": i, "request_type": kind,
+                         "wait_s": wait, "slo_s": slo, "prediction_p90_s": pred,
+                         "chat_tpot_slo_s": config.get("chat.tpot") if kind == "chat" else None,
+                         "prediction_target": "prefill" if kind == "chat" else "inference_time" if kind in ("code", "summary") else None,
+                         "length_quantiles": tuple(req.r1_shadow_lengths), "score": score,
+                         "protected": protected, "protection_reason": "wait_limit" if protected else None,
+                         "missing_reason": reason, "tpot_status": "not_estimable" if kind == "chat" else None})
+        comparable = [r for r in rows if r["score"] is not None]
+        ordered = sorted(comparable, key=lambda r: (not r["protected"], r["position"] if r["protected"] else r["score"], r["position"]))
+        complete = len(comparable) == len(rows)
+        original = [r["request_id"] for r in rows]
+        ranked = [r["request_id"] for r in ordered]
+        elapsed = time.perf_counter_ns() - started
+        self.emit("shadow_type_rank_v1", {"decision_batch_id": snapshot["decision_batch_id"],
+                  "candidate_source": "shadow_sweep_skip_ineligible", "candidate_count": len(rows),
+                  "config_sha256": type_slo.get("config_sha256") if isinstance(type_slo, dict) else None,
+                  "config_run_id": type_slo.get("run_id") if isinstance(type_slo, dict) else None,
+                  "scheduled_timestamp_s": timestamp, "running_count": snapshot["running_count"],
+                  "token_budget": snapshot["token_budget"], "kv_usage": snapshot["kv_usage"],
+                  "original_ids": original, "comparable_order_ids": ranked,
+                  "status": "complete" if complete else "partial", "comparison_valid": complete and len(rows) >= 2,
+                  "order_changed": ranked != original if complete and len(rows) >= 2 else None,
+                  "wait_limit_s": self.config.type_rank_wait_limit, "quantile": .9,
+                  "prefill_model_sha256": getattr(self.prefill_predictor, "sha256", None),
+                  "itl_status": "unavailable_in_scheduler", "candidates": rows,
+                  "compute_ns": elapsed})
+        self.observe_elapsed("type_rank_foreground_v1", started, "complete", len(rows))
 
     def sort_candidates(self, snapshot, candidates, predictions):
         """Record a separate ordering; failures do not change prediction success."""
