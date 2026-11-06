@@ -19,8 +19,14 @@ class AdmissionConfig:
     wait_limit_seconds: float = None
     budget_seconds: float = None
     slo_observation: bool = False
+    feasible_protection: bool = False
+    protection_slo_multiplier: float = 1.0
 
     def __post_init__(self):
+        if self.feasible_protection and (self.head_policy != "type_slo" or
+                not math.isfinite(self.protection_slo_multiplier) or
+                self.protection_slo_multiplier <= 0):
+            raise ValueError("feasible protection requires type_slo and finite positive multiplier")
         if self.slo_observation and self.mode != "observe":
             raise ValueError("SLO shadow observation requires admission mode observe")
         if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk", "type_slo"):
@@ -70,8 +76,17 @@ class AdmissionConfig:
         slo_observation = os.environ.get("VLLM_R1_SLO_SHADOW", "0")
         if slo_observation not in ("0", "1"):
             raise ValueError("VLLM_R1_SLO_SHADOW must be 0 or 1")
+        feasible = os.environ.get("VLLM_R1_ADMISSION_FEASIBLE_PROTECTION", "0")
+        if feasible not in ("0", "1"):
+            raise ValueError("FEASIBLE_PROTECTION must be 0 or 1")
+        multiplier = 1.0
+        if feasible == "1":
+            try:
+                multiplier = float(os.environ.get("VLLM_R1_ADMISSION_PROTECTION_SLO_MULTIPLIER", "1"))
+            except ValueError as exc:
+                raise ValueError("PROTECTION_SLO_MULTIPLIER must be numeric") from exc
         return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget,
-                   slo_observation == "1")
+                   slo_observation == "1", feasible == "1", multiplier)
 
 
 def unsupported_reason(config):
@@ -151,6 +166,10 @@ class AdmissionController:
             frame.update(score_rule="type_slo_normalized_p90_wait_protection_v1",
                          type_rank_candidates=(), type_rank_ns=0,
                          type_prefill_ns=0, type_fallback=None)
+            if self.config.feasible_protection:
+                frame.update(score_rule="type_slo_feasible_protection_v1",
+                             protection_slo_multiplier=self.config.protection_slo_multiplier,
+                             feasible_rule_branch=None)
         return frame
 
     def eligible(self, r):
@@ -324,6 +343,24 @@ class AdmissionController:
                     frame["reason"] = "type_information_unavailable"
                     frame["type_rank_ns"] = time.perf_counter_ns() - started
                     return None
+                if self.config.feasible_protection:
+                    cap = self.shadow.config.type_rank_wait_limit
+                    if not math.isfinite(cap) or cap <= 0:
+                        raise ValueError("invalid_protection_cap")
+                    rows = [dict(row, feasible_protection_limit_s=min(
+                        cap, self.config.protection_slo_multiplier * row["slo_s"]))
+                        for row in rows]
+                    for row in rows:
+                        row["feasible_protected"] = row["wait_s"] >= row["feasible_protection_limit_s"]
+                    protected = [row for row in rows if row["feasible_protected"]]
+                    feasible = [row for row in rows if not row["feasible_protected"] and row["score"] >= 0]
+                    infeasible = [row for row in rows if not row["feasible_protected"] and row["score"] < 0]
+                    frame["feasible_rule_branch"] = ("protected" if protected else
+                        "feasible" if feasible else "all_infeasible_fcfs")
+                    ordered_rows = (sorted(protected, key=lambda row: row["position"]) +
+                        sorted(feasible, key=lambda row: (row["score"], row["position"])) +
+                        sorted(infeasible, key=lambda row: row["position"]))
+                    frame["type_rank_candidates"] = rows
                 type_order = [row["position"] for row in ordered_rows]
                 if sorted(type_order) != list(range(len(candidates))):
                     raise ValueError("invalid_type_order")

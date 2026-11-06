@@ -54,3 +54,30 @@ predicted; evaluate client TTFT, TPOT and joint Goodput separately. The finite
 prefix, sampling and resource constraints mean waiting protection does not
 establish a global bound or no-starvation guarantee. CPU stub tests are not
 real model/GPU/service validation.
+# Experimental feasible-budget protection
+
+Opt in only with the existing `type_slo` admission setup by setting
+`VLLM_R1_ADMISSION_FEASIBLE_PROTECTION=1` and optionally
+`VLLM_R1_ADMISSION_PROTECTION_SLO_MULTIPLIER=1` (finite and positive; default 1).
+The existing shadow `TYPE_RANK_WAIT_LIMIT` supplies the protection cap. For
+each candidate the threshold is `min(cap, multiplier * slo_seconds)`, using
+chat TTFT and code/summary E2E targets. Protected candidates retain queue order;
+other nonnegative-score candidates follow in increasing score, then negative-score
+candidates in original order. When all scores are negative and none is protected,
+the original order is retained. Missing inputs preserve the existing fail-closed
+window fallback. This affects only the normal eligible prefix; resources and native
+preemption/skipping logic remain unchanged. Observe mode records without applying.
+
+`r1_admission_v1` records `feasible_rule_branch`, multiplier, and each candidate's
+`feasible_protection_limit_s` and `feasible_protected`. The separate
+`shadow_type_rank_v1` record continues to describe the original shadow ranking,
+not this experimental policy; use the admission record for actual planned order.
+Protection is not a hard wait-time or SLO guarantee. Chat's TPOT is not predicted.
+Client E2E SLO results include waiting; predictor target is admission to finish.
+Both threshold and multiplier are experimental and must be evaluated in live runs.
+
+In this experiment, the request type is the real `r1_request_type` supplied by
+the mixed client and carried through the completions API and EngineCore request
+to the Scheduler. The predictor does not take this label as a feature. This is
+not a type-label-free online deployment or a final type-inference solution.
+A negative predicted margin is an estimate, not proof of an actual SLO miss.
