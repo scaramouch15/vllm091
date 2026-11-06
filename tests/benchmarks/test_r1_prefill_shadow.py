@@ -11,7 +11,7 @@ analysis=importlib.util.module_from_spec(spec);spec.loader.exec_module(analysis)
 spec2=importlib.util.spec_from_file_location('prefill_compare',ROOT/'tools/r1_shadow/compare_prefill_runs.py')
 compare=importlib.util.module_from_spec(spec2);spec2.loader.exec_module(compare)
 class PF:
- def __init__(self,fail=False): self.calls=[];self.fail=fail
+ def __init__(self,fail=False): self.calls=[];self.fail=fail;self.sha256='a'*64
  def predict(self,candidates,running,kv):
   self.calls.append(([r.request_id for r in candidates],running,kv))
   if self.fail:raise RuntimeError('private')
@@ -35,6 +35,13 @@ class Tests(unittest.TestCase):
   for extras in ({'VLLM_R1_PREFILL_SHADOW':'1'}, {'VLLM_R1_PREFILL_SHADOW':'bad'}, {'VLLM_R1_PREFILL_TIMING':'1','VLLM_R1_ADMISSION_MODE':'observe'}):
    with patch.dict(os.environ,dict(base,**extras),clear=True),self.assertRaises(ValueError):S.ShadowConfig.from_env()
   with patch.dict(os.environ,{'VLLM_R1_PREFILL_SHADOW':'1'},clear=True),self.assertRaises(ValueError):S.ShadowConfig.from_env()
+  required=dict(base,VLLM_R1_PREFILL_SHADOW='1',VLLM_R1_PREFILL_MODEL='x',VLLM_R1_PREFILL_PROVENANCE='report-id')
+  with patch.dict(os.environ,required,clear=True),self.assertRaises(ValueError):S.ShadowConfig.from_env()
+  for value in ('', 'a'*63, 'g'*64):
+   with patch.dict(os.environ,dict(required,VLLM_R1_PREFILL_MODEL_SHA256=value),clear=True),self.assertRaises(ValueError):S.ShadowConfig.from_env()
+  with patch.dict(os.environ,dict(required,VLLM_R1_PREFILL_MODEL_SHA256='A'*64),clear=True):
+   self.assertEqual(S.ShadowConfig.from_env().prefill_sha256,'a'*64)
+  with patch.dict(os.environ,dict(required,VLLM_R1_PREFILL_MODEL_SHA256='a'*64,VLLM_R1_PREFILL_PROVENANCE=''),clear=True),self.assertRaises(ValueError):S.ShadowConfig.from_env()
  def test_scheduler_sweep_same_queue_and_log(self):
   pf=PF();obj=self.make(pf,every=2,timing=True);queue=[old.request('a'),old.request('b')]
   scheduler=native.scheduler(waiting=queue);scheduler.r1_shadow=obj
@@ -47,6 +54,8 @@ class Tests(unittest.TestCase):
   pred=next(r for r in records if r['record_type']=='shadow_prefill_v1')
   self.assertEqual([x['engine_request_id'] for x in pred['candidates']],['a','b'])
   self.assertEqual(pred['target'],'first_scheduled_to_first_token_batch_seconds')
+  self.assertEqual(pred['prefill_model_sha256'],'a'*64)
+  self.assertEqual(pred['target_source'],'operator_attested_training_provenance')
   self.assertEqual(pred['candidate_count'],2)
  def test_failure_isolated_and_interval_skips(self):
   pf=PF(True);obj=self.make(pf,every=2);q=native.deque([old.request('a')]);before=list(q)
@@ -63,16 +72,43 @@ class Tests(unittest.TestCase):
  def test_hash_before_deserialize_and_schema(self):
   model_path=self.d/'head.joblib';model_path.write_bytes(b'trusted-test')
   digest=hashlib.sha256(b'trusted-test').hexdigest(); fake=types.SimpleNamespace(load=unittest.mock.Mock())
-  with patch.dict(sys.modules,{'joblib':fake}),patch.object(S,'PREFILL_SHA256','0'*64):
-   with self.assertRaisesRegex(ValueError,'SHA256'):S.PrefillPredictor(model_path)
+  with patch.dict(sys.modules,{'joblib':fake}):
+   with self.assertRaisesRegex(ValueError,'SHA256'):S.PrefillPredictor(model_path,'0'*64)
    fake.load.assert_not_called()
   estimator=types.SimpleNamespace(n_features_in_=3,predict=lambda x:[1.]*len(x))
   fake.load.return_value={'features':S.PREFILL_FIELDS,'quantiles':S.QUANTILES,'models':[estimator]*3}
-  with patch.dict(sys.modules,{'joblib':fake}),patch.object(S,'PREFILL_SHA256',digest):
-   head=S.PrefillPredictor(model_path)
+  with patch.dict(sys.modules,{'joblib':fake}):
+   head=S.PrefillPredictor(model_path,digest)
+   self.assertEqual(fake.load.call_args.args[0].getvalue(),b'trusted-test')
+   self.assertEqual(head.sha256,digest)
    self.assertEqual(head.predict([old.request('a')],0,.2),[[1.,1.,1.]])
    fake.load.return_value['features']=['kv_usage','running_count','num_prompt_tokens']
-   with self.assertRaisesRegex(ValueError,'schema'):S.PrefillPredictor(model_path)
+   with self.assertRaisesRegex(ValueError,'schema'):S.PrefillPredictor(model_path,digest)
+   with self.assertRaisesRegex(ValueError,'cannot read'):S.PrefillPredictor(self.d/'missing',digest)
+ def test_load_uses_verified_bytes_even_if_file_changes(self):
+  model_path=self.d/'head.joblib';model_path.write_bytes(b'original')
+  digest=hashlib.sha256(b'original').hexdigest()
+  estimator=types.SimpleNamespace(n_features_in_=3,predict=lambda x:[1.]*len(x))
+  artifact={'features':S.PREFILL_FIELDS,'quantiles':S.QUANTILES,'models':[estimator]*3}
+  def load(stream):
+   model_path.write_bytes(b'replaced')
+   self.assertEqual(stream.read(),b'original')
+   return artifact
+  with patch.dict(sys.modules,{'joblib':types.SimpleNamespace(load=load)}):
+   self.assertEqual(S.PrefillPredictor(model_path,digest).sha256,digest)
+ def test_invalid_artifact_and_predictions(self):
+  model_path=self.d/'head.joblib';model_path.write_bytes(b'x');digest=hashlib.sha256(b'x').hexdigest()
+  estimator=types.SimpleNamespace(n_features_in_=3,predict=lambda x:[1.]*len(x))
+  artifact={'features':S.PREFILL_FIELDS,'quantiles':S.QUANTILES,'models':[estimator]*3}
+  fake=types.SimpleNamespace(load=unittest.mock.Mock())
+  with patch.dict(sys.modules,{'joblib':fake}):
+   for invalid in (dict(artifact,quantiles=[.5,.9]),dict(artifact,models=[estimator]),dict(artifact,models=[types.SimpleNamespace(n_features_in_=2,predict=lambda x:[]) ]*3)):
+    fake.load.return_value=invalid
+    with self.assertRaisesRegex(ValueError,'schema'):S.PrefillPredictor(model_path,digest)
+   fake.load.return_value=dict(artifact,models=[types.SimpleNamespace(n_features_in_=3,predict=lambda x:[float('nan')]*len(x))]*3)
+   with self.assertRaisesRegex(ValueError,'invalid prefill prediction'):S.PrefillPredictor(model_path,digest).predict([old.request('a')],0,.2)
+   fake.load.return_value=dict(artifact,models=[types.SimpleNamespace(n_features_in_=3,predict=lambda x:[])]*3)
+   with self.assertRaisesRegex(ValueError,'invalid prefill prediction'):S.PrefillPredictor(model_path,digest).predict([old.request('a')],0,.2)
  def test_same_batch_admission_join_and_loss(self):
   obj=self.make(PF());req=old.request('a');q=native.deque([req,old.request('b')])
   decision=obj.sweep(q,[],types.SimpleNamespace(usage=.2),20,3);obj.admit(req,decision)

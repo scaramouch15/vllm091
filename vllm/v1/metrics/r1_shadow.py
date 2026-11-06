@@ -8,6 +8,7 @@ The immutable envelope is local to the frontend and removed before Core IPC.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import math
 import os
@@ -22,8 +23,8 @@ from itertools import islice
 from pathlib import Path
 
 MODEL_SHA256 = "23aff057712e7bec05db91d470af39a1b34eabddbf5852914710e1b8e4b96e1f"
-PREFILL_SHA256 = "4ab94aa14148645ab06dab7d7adfc49a882836b5305e96657d37b075863c021c"
 PREFILL_FIELDS = ["num_prompt_tokens", "running_count", "kv_usage"]
+PREFILL_TARGET = "first_scheduled_to_first_token_batch_seconds"
 INTERNAL_KEY = "_vllm_r1_shadow_static_v1"
 QUANTILES = [0.5, 0.9, 0.95]
 SORT_RULE = "p90_ascending_stable_v1"
@@ -128,6 +129,8 @@ class ShadowConfig:
     sort: bool = False
     prefill_model: Path | None = None
     schedule_timing: bool = False
+    prefill_sha256: str | None = None
+    prefill_provenance: str | None = None
 
     @classmethod
     def from_env(cls):
@@ -155,13 +158,21 @@ class ShadowConfig:
                 "prefill observation requires ADMISSION_MODE=off")
         prefill_path = os.environ.get("VLLM_R1_PREFILL_MODEL", "")
         require(prefill == "0" or bool(prefill_path), "PREFILL_MODEL is required")
+        expected_sha = os.environ.get("VLLM_R1_PREFILL_MODEL_SHA256", "")
+        provenance = os.environ.get("VLLM_R1_PREFILL_PROVENANCE", "")
+        if prefill == "1":
+            require(re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha) is not None,
+                    "PREFILL_MODEL_SHA256 must be an explicit 64-digit hexadecimal SHA256")
+            require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", provenance) is not None,
+                    "PREFILL_PROVENANCE must be an explicit safe provenance identifier")
         require(sort in ("0", "1"), "VLLM_R1_SHADOW_SORT must be 0 or 1")
         require(1 <= cap <= scan <= 4096 and every > 0,
                 "require 1 <= candidates <= scan_limit <= 4096, every > 0")
         return cls(Path(model).expanduser().resolve(), run,
                    Path(directory).expanduser().resolve(), cap, scan, every,
                    sort == "1", Path(prefill_path).expanduser().resolve() if prefill == "1" else None,
-                   timing == "1")
+                   timing == "1", expected_sha.lower() if prefill == "1" else None,
+                   provenance if prefill == "1" else None)
 
 
 @dataclass(frozen=True)
@@ -322,13 +333,21 @@ class Predictor:
 
 
 class PrefillPredictor:
-    """The hash pins the audited artifact and its first-schedule-to-token seconds target."""
-    def __init__(self, path):
-        require(hashlib.sha256(path.read_bytes()).hexdigest() == PREFILL_SHA256,
+    """Validate and deserialize the same operator-identified artifact bytes."""
+    def __init__(self, path, expected_sha):
+        require(isinstance(expected_sha, str) and
+                re.fullmatch(r"[0-9a-f]{64}", expected_sha) is not None,
+                "invalid expected prefill SHA256")
+        try:
+            model_bytes = path.read_bytes()
+        except OSError as exc:
+            raise ValueError("R1 shadow: cannot read prefill model") from exc
+        actual_sha = hashlib.sha256(model_bytes).hexdigest()
+        require(actual_sha == expected_sha,
                 "prefill model SHA256 mismatch")
         import joblib
         import numpy as np
-        artifact = joblib.load(path)
+        artifact = joblib.load(io.BytesIO(model_bytes))
         require(isinstance(artifact, dict) and artifact.get("features") == PREFILL_FIELDS
                 and artifact.get("quantiles") == QUANTILES
                 and isinstance(artifact.get("models"), (list, tuple))
@@ -339,6 +358,7 @@ class PrefillPredictor:
                 "prefill estimator feature schema mismatch")
         self.np = np
         self.models = artifact["models"]
+        self.sha256 = actual_sha
 
     def predict(self, candidates, running_count, kv_usage):
         matrix = self.np.asarray([[r.num_prompt_tokens, running_count, kv_usage]
@@ -585,10 +605,12 @@ class Shadow:
             self.counts["prefill_success"] += 1
             self.emit("shadow_prefill_v1", {
                 "decision_batch_id": snapshot["decision_batch_id"],
-                "prefill_model_sha256": PREFILL_SHA256,
+                "prefill_model_sha256": self.prefill_predictor.sha256,
                 "candidate_source": "shadow_sweep_skip_ineligible",
                 "candidate_count": len(candidates), "prediction_ns": prediction_ns,
-                "target": "first_scheduled_to_first_token_batch_seconds",
+                "target": PREFILL_TARGET,
+                "target_source": "operator_attested_training_provenance",
+                "provenance_id": self.config.prefill_provenance,
                 "candidates": [{"engine_request_id": r.request_id, "quantiles_s": tuple(q)}
                                for r, q in zip(candidates, values)]})
         except Exception as exc:
@@ -691,7 +713,7 @@ def create_shadow(vllm_config, role):
     start = time.perf_counter_ns()
     validate_service(vllm_config)
     predictor = Predictor(config.model, role)
-    prefill_predictor = (PrefillPredictor(config.prefill_model)
+    prefill_predictor = (PrefillPredictor(config.prefill_model, config.prefill_sha256)
                          if role == "core" and config.prefill_model is not None else None)
     # Import/reuse only after enabled; collector switch / ID policy is irrelevant.
     from vllm.v1.metrics.request_collector import CollectionConfig, RecordWriter
@@ -706,7 +728,11 @@ def create_shadow(vllm_config, role):
             "candidates": config.candidates, "scan_limit": config.scan_limit,
             "every": config.every, "threadpools": predictor.threadpools,
             "prefill_enabled": config.prefill_model is not None,
-            "prefill_model_sha256": PREFILL_SHA256 if config.prefill_model is not None else None,
+            "prefill_model_sha256": config.prefill_sha256,
+            "prefill_sha_verified_in_this_process": prefill_predictor is not None,
+            "prefill_target": PREFILL_TARGET if config.prefill_model is not None else None,
+            "prefill_target_source": "operator_attested_training_provenance" if config.prefill_model is not None else None,
+            "prefill_provenance_id": config.prefill_provenance,
             "prefill_schedule_timing": config.schedule_timing,
             "shadow_sort_enabled": config.sort, "shadow_sort_rule": SORT_RULE,
             "shadow_sort_timing_version": SORT_TIMING_VERSION,
