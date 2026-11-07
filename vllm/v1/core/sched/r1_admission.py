@@ -23,8 +23,16 @@ class AdmissionConfig:
     protection_slo_multiplier: float = 1.0
     fairness_compare_observe: bool = False
     fairness_wait_limit_seconds: float = None
+    fairness_apply: bool = False
 
     def __post_init__(self):
+        if self.fairness_apply and (
+                self.mode != "apply" or self.head_policy != "type_slo" or
+                self.feasible_protection or self.fairness_compare_observe or
+                not self.time_observation or type(self.fairness_wait_limit_seconds) not in (int, float) or
+                not math.isfinite(self.fairness_wait_limit_seconds) or
+                self.fairness_wait_limit_seconds <= 0):
+            raise ValueError("fairness apply requires apply, type_slo, time observation, finite positive wait limit, and no feasible protection or observe comparison")
         if self.fairness_compare_observe and (
                 self.mode != "observe" or self.head_policy != "type_slo" or
                 not self.feasible_protection or self.fairness_wait_limit_seconds is None or
@@ -96,15 +104,18 @@ class AdmissionConfig:
         compare = os.environ.get("VLLM_R1_FAIRNESS_COMPARE_OBSERVE", "0")
         if compare not in ("0", "1"):
             raise ValueError("FAIRNESS_COMPARE_OBSERVE must be 0 or 1")
+        fairness_apply = os.environ.get("VLLM_R1_FAIRNESS_APPLY", "0")
+        if fairness_apply not in ("0", "1"):
+            raise ValueError("FAIRNESS_APPLY must be 0 or 1")
         fairness_wait = None
-        if compare == "1":
+        if compare == "1" or fairness_apply == "1":
             try:
                 fairness_wait = float(os.environ["VLLM_R1_FAIRNESS_WAIT_LIMIT_SECONDS"])
             except (KeyError, ValueError) as exc:
                 raise ValueError("FAIRNESS_WAIT_LIMIT_SECONDS must be explicit and numeric") from exc
         return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget,
                    slo_observation == "1", feasible == "1", multiplier,
-                   compare == "1", fairness_wait)
+                   compare == "1", fairness_wait, fairness_apply == "1")
 
 
 def observe_fairness_order(rows, wait_limit):
@@ -200,6 +211,11 @@ class AdmissionController:
                 frame.update(score_rule="type_slo_feasible_protection_v1",
                              protection_slo_multiplier=self.config.protection_slo_multiplier,
                              feasible_rule_branch=None)
+            if self.config.fairness_apply:
+                frame.update(score_rule="type_slo_fairness_apply_v1",
+                             fairness_apply_status="not_evaluated", fairness_apply_branch=None,
+                             fairness_apply_wait_limit_s=self.config.fairness_wait_limit_seconds,
+                             fairness_apply_ns=0)
             if self.config.fairness_compare_observe:
                 frame.update(fairness_compare_status="not_evaluated",
                              fairness_compare_wait_limit_s=self.config.fairness_wait_limit_seconds,
@@ -379,6 +395,23 @@ class AdmissionController:
                     frame["reason"] = "type_information_unavailable"
                     frame["type_rank_ns"] = time.perf_counter_ns() - started
                     return None
+                if self.config.fairness_apply:
+                    fairness_start = time.perf_counter_ns()
+                    try:
+                        ids = frame["candidate_ids"]
+                        if (len(set(ids)) != len(ids) or
+                                tuple(row["request_id"] for row in rows) != ids or
+                                tuple(row["position"] for row in rows) != tuple(range(len(ids)))):
+                            raise ValueError("fairness_candidate_identity_mismatch")
+                        branch, alternate = observe_fairness_order(
+                            rows, self.config.fairness_wait_limit_seconds)
+                        if len(alternate) != len(ids) or set(alternate) != set(ids):
+                            raise ValueError("fairness_order_identity_mismatch")
+                        by_id = {row["request_id"]: row for row in rows}
+                        ordered_rows = [by_id[request_id] for request_id in alternate]
+                        frame["fairness_apply_branch"] = branch
+                    finally:
+                        frame["fairness_apply_ns"] = time.perf_counter_ns() - fairness_start
                 if self.config.feasible_protection:
                     cap = self.shadow.config.type_rank_wait_limit
                     if not math.isfinite(cap) or cap <= 0:
@@ -435,6 +468,8 @@ class AdmissionController:
             frame["error_type"] = type(exc).__name__
             return None
         frame["decision_ns"] = time.perf_counter_ns() - started
+        if self.config.fairness_apply:
+            frame["fairness_apply_status"] = "planned"
         if self.config.fairness_compare_observe:
             compare_start = time.perf_counter_ns()
             try:
