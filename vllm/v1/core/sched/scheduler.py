@@ -202,7 +202,8 @@ class Scheduler(SchedulerInterface):
                 "VLLM_R1_ADMISSION_TIME_OBSERVE" in os.environ or
                 "VLLM_R1_SLO_SHADOW" in os.environ or
                 "VLLM_R1_FAIRNESS_COMPARE_OBSERVE" in os.environ or
-                "VLLM_R1_FAIRNESS_APPLY" in os.environ):
+                "VLLM_R1_FAIRNESS_APPLY" in os.environ or
+                "VLLM_R1_FAIRNESS_ALTERNATE" in os.environ):
             from vllm.v1.core.sched.r1_admission import AdmissionConfig
             admission_config = AdmissionConfig.from_env()
             if (admission_config.mode in ("observe", "apply") and

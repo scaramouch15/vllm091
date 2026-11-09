@@ -24,8 +24,11 @@ class AdmissionConfig:
     fairness_compare_observe: bool = False
     fairness_wait_limit_seconds: float = None
     fairness_apply: bool = False
+    fairness_alternate: bool = False
 
     def __post_init__(self):
+        if self.fairness_alternate and not self.fairness_apply:
+            raise ValueError("fairness alternate requires fairness apply")
         if self.fairness_apply and (
                 self.mode != "apply" or self.head_policy != "type_slo" or
                 self.feasible_protection or self.fairness_compare_observe or
@@ -107,6 +110,9 @@ class AdmissionConfig:
         fairness_apply = os.environ.get("VLLM_R1_FAIRNESS_APPLY", "0")
         if fairness_apply not in ("0", "1"):
             raise ValueError("FAIRNESS_APPLY must be 0 or 1")
+        fairness_alternate = os.environ.get("VLLM_R1_FAIRNESS_ALTERNATE", "0")
+        if fairness_alternate not in ("0", "1"):
+            raise ValueError("FAIRNESS_ALTERNATE must be 0 or 1")
         fairness_wait = None
         if compare == "1" or fairness_apply == "1":
             try:
@@ -115,7 +121,7 @@ class AdmissionConfig:
                 raise ValueError("FAIRNESS_WAIT_LIMIT_SECONDS must be explicit and numeric") from exc
         return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget,
                    slo_observation == "1", feasible == "1", multiplier,
-                   compare == "1", fairness_wait, fairness_apply == "1")
+                   compare == "1", fairness_wait, fairness_apply == "1", fairness_alternate == "1")
 
 
 def observe_fairness_order(rows, wait_limit):
@@ -128,6 +134,28 @@ def observe_fairness_order(rows, wait_limit):
                sorted(feasible, key=lambda r: (r["score"], r["position"])) +
                sorted(infeasible, key=lambda r: r["position"]))
     return branch, tuple(r["request_id"] for r in ordered)
+
+
+def alternate_fairness_order(rows, wait_limit, turn):
+    """Interleave competing groups; preserve existing ordering within each group."""
+    protected = sorted((r for r in rows if r["wait_s"] >= wait_limit), key=lambda r: r["position"])
+    feasible = sorted((r for r in rows if r["wait_s"] < wait_limit and r["score"] >= 0),
+                      key=lambda r: (r["score"], r["position"]))
+    infeasible = sorted((r for r in rows if r["wait_s"] < wait_limit and r["score"] < 0),
+                        key=lambda r: r["position"])
+    competing = bool(protected and feasible)
+    if not competing:
+        branch, ids = observe_fairness_order(rows, wait_limit)
+        return branch, ids, False
+    groups = {"protected": protected, "feasible": feasible}
+    order = []
+    while groups["protected"] and groups["feasible"]:
+        order.append(groups[turn].pop(0))
+        turn = "protected" if turn == "feasible" else "feasible"
+    order.extend(groups["protected"])
+    order.extend(groups["feasible"])
+    order.extend(infeasible)
+    return "alternate", tuple(r["request_id"] for r in order), True
 
 
 def unsupported_reason(config):
@@ -173,6 +201,7 @@ class AdmissionController:
         self.config, self.shadow, self.valid_lengths = config, shadow, valid_lengths
         self.instance_id = uuid.uuid4().hex
         self.schedules = self.opportunities = self.prediction_successes = 0
+        self.fairness_next = "feasible"
 
     def begin(self):
         self.schedules += 1
@@ -216,6 +245,8 @@ class AdmissionController:
                              fairness_apply_status="not_evaluated", fairness_apply_branch=None,
                              fairness_apply_wait_limit_s=self.config.fairness_wait_limit_seconds,
                              fairness_apply_ns=0)
+                if self.config.fairness_alternate:
+                    frame["_fairness_advanced"] = set()
             if self.config.fairness_compare_observe:
                 frame.update(fairness_compare_status="not_evaluated",
                              fairness_compare_wait_limit_s=self.config.fairness_wait_limit_seconds,
@@ -403,8 +434,20 @@ class AdmissionController:
                                 tuple(row["request_id"] for row in rows) != ids or
                                 tuple(row["position"] for row in rows) != tuple(range(len(ids)))):
                             raise ValueError("fairness_candidate_identity_mismatch")
-                        branch, alternate = observe_fairness_order(
-                            rows, self.config.fairness_wait_limit_seconds)
+                        if self.config.fairness_alternate:
+                            branch, alternate, competing = alternate_fairness_order(
+                                rows, self.config.fairness_wait_limit_seconds, self.fairness_next)
+                            frame["fairness_alternate_competing"] = competing
+                            frame["fairness_alternate_turn_before"] = self.fairness_next
+                            if competing:
+                                frame["_fairness_groups"] = {
+                                    row["request_id"]: (
+                                        "protected" if row["wait_s"] >= self.config.fairness_wait_limit_seconds
+                                        else "feasible" if row["score"] >= 0 else None)
+                                    for row in rows}
+                        else:
+                            branch, alternate = observe_fairness_order(
+                                rows, self.config.fairness_wait_limit_seconds)
                         if len(alternate) != len(ids) or set(alternate) != set(ids):
                             raise ValueError("fairness_order_identity_mismatch")
                         by_id = {row["request_id"]: row for row in rows}
@@ -551,6 +594,16 @@ class AdmissionController:
     def admitted(self, frame, request):
         key = "window_admitted" if request.request_id in frame["_candidate_set"] else "tail_admitted"
         frame[key].append(request.request_id)
+        if (self.config.fairness_alternate and key == "window_admitted"
+                and frame.get("_applied") and frame.get("fairness_alternate_competing")):
+            advanced = frame["_fairness_advanced"]
+            if request.request_id not in advanced:
+                group = frame["_fairness_groups"][request.request_id]
+                if group == "protected":
+                    self.fairness_next = "feasible"
+                elif group == "feasible":
+                    self.fairness_next = "protected"
+                advanced.add(request.request_id)
 
     def restore(self, scheduler, frame, skipped):
         if not frame["_applied"]:
@@ -683,6 +736,8 @@ class AdmissionController:
         frame["tail_A"] = frame["tail_attempt_count"]
         frame["tail_M"] = len(frame["tail_admitted"])
         frame["actual_admission_order"] = frame["window_admitted"] + frame["tail_admitted"]
+        if self.config.fairness_alternate:
+            frame["fairness_alternate_turn_after"] = self.fairness_next
         if self.config.head_policy == "type_slo":
             positions = {request_id: index for index, request_id in enumerate(frame["candidate_ids"])}
             admitted_positions = [positions[rid] for rid in frame["window_admitted"]]
