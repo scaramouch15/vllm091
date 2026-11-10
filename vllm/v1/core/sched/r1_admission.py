@@ -46,9 +46,11 @@ class AdmissionConfig:
                 not math.isfinite(self.protection_slo_multiplier) or
                 self.protection_slo_multiplier <= 0):
             raise ValueError("feasible protection requires type_slo and finite positive multiplier")
+        if self.slo_observation and self.head_policy == "length_sjf" and self.mode != "off":
+            raise ValueError("SLO shadow observation is incompatible with length_sjf")
         if self.slo_observation and self.mode != "observe":
             raise ValueError("SLO shadow observation requires admission mode observe")
-        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk", "type_slo"):
+        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk", "type_slo", "length_sjf"):
             raise ValueError("invalid VLLM_R1_ADMISSION_HEAD_POLICY")
         if self.mode in ("observe", "apply") and self.head_policy != "protected" and self.skip_single_slot:
             raise ValueError("ranked or conditional head policy conflicts with SKIP_SINGLE_SLOT=1")
@@ -225,6 +227,10 @@ class AdmissionController:
                 "trigger_prefix_ns": 0, "prediction_ns": 0,
                 "decision_ns": 0, "apply_ns": 0, "restore_ns": 0,
                 "_candidates": (), "_candidate_set": frozenset(), "_applied": False}
+        if self.config.head_policy == "length_sjf":
+            frame.update(score_rule="predicted_output_length_p50_sjf_v1",
+                         length_p50_scores=(), length_valid_count=0,
+                         cached_length_read_ns=0)
         if self.config.head_policy in ("conditional_wait", "conditional_risk"):
             frame.update(conditional_policy=self.config.head_policy, ranked_head_displaced=None,
                          ranked_head_position=None, wait_seconds=None,
@@ -296,6 +302,15 @@ class AdmissionController:
                         tuple(r.request_id for r in candidates),
                         tuple(row[1] for row in values))
 
+    def make_length_decision(self, frame, candidates):
+        # Revalidate the cached frontend results immediately before constructing
+        # a decision. These are output-token quantiles, not time predictions.
+        if any(not self.valid_lengths(r.r1_shadow_lengths) for r in candidates):
+            raise ValueError("invalid cached output-length prediction")
+        return Decision(self.instance_id, frame["schedule_id"],
+                        tuple(r.request_id for r in candidates),
+                        tuple(r.r1_shadow_lengths[0] for r in candidates))
+
     def prepare(self, scheduler, frame, preempted, token_budget, timestamp):
         start = time.perf_counter_ns()
         if self.config.slo_observation:
@@ -332,6 +347,14 @@ class AdmissionController:
             frame["checked"] += 1
             if not self.eligible(r):
                 frame["prefix_stop"] = "ineligible"
+                if self.config.head_policy == "length_sjf":
+                    status = r.status.name
+                    frame["prefix_stop_detail"] = (
+                        "preempted" if status == "PREEMPTED" else
+                        "already_admitted" if getattr(r, "r1_shadow_admitted", False) else
+                        "special_status" if status != "WAITING" else
+                        "missing_or_invalid_cached_length" if not self.valid_lengths(r.r1_shadow_lengths) else
+                        "unsupported_or_not_first_admission")
                 if self.config.slo_observation:
                     status = r.status.name
                     reason = ("preempted" if status == "PREEMPTED" else
@@ -388,13 +411,23 @@ class AdmissionController:
             if not math.isfinite(kv_usage) or not 0 <= kv_usage <= 1:
                 raise ValueError("invalid KV usage")
             frame["running_count"], frame["kv_usage"] = running_count, kv_usage
-            decision = self.make_decision(frame, candidates, running_count, kv_usage)
+            if self.config.head_policy == "length_sjf":
+                decision = self.make_length_decision(frame, candidates)
+            else:
+                decision = self.make_decision(frame, candidates, running_count, kv_usage)
         except Exception as exc:
-            frame["prediction_ns"] = time.perf_counter_ns() - started
-            frame["reason"] = "prediction_failed"
+            elapsed = time.perf_counter_ns() - started
+            timer = ("cached_length_read_ns" if self.config.head_policy == "length_sjf"
+                     else "prediction_ns")
+            frame[timer] = elapsed
+            frame["reason"] = ("snapshot_or_cached_length_failed"
+                               if self.config.head_policy == "length_sjf"
+                               else "prediction_failed")
             frame["error_type"] = type(exc).__name__
             return None
-        frame["prediction_ns"] = time.perf_counter_ns() - started
+        timer = ("cached_length_read_ns" if self.config.head_policy == "length_sjf"
+                 else "prediction_ns")
+        frame[timer] = time.perf_counter_ns() - started
         type_order = None
         if self.config.head_policy == "type_slo":
             started = time.perf_counter_ns()
@@ -481,7 +514,8 @@ class AdmissionController:
                 frame["type_fallback"] = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
                 frame["reason"] = "type_prediction_or_decision_failed"
                 return None
-        self.prediction_successes += 1
+        if self.config.head_policy != "length_sjf":
+            self.prediction_successes += 1
         started = time.perf_counter_ns()
         try:
             actual = tuple(islice(scheduler.waiting, len(candidates)))
@@ -503,7 +537,15 @@ class AdmissionController:
                 order = sorted(range(len(ids)), key=lambda i: (decision.scores[i], i))
             ordered = tuple(candidates[i] for i in order)
             frame["sorted_ids"] = tuple(r.request_id for r in ordered)
-            frame["scores_p90"] = decision.scores
+            if self.config.head_policy == "length_sjf":
+                if any(not self.valid_lengths(r.r1_shadow_lengths) or
+                       r.r1_shadow_lengths[0] != score
+                       for r, score in zip(candidates, decision.scores)):
+                    raise ValueError("cached output-length prediction changed")
+                frame["length_p50_scores"] = decision.scores
+                frame["length_valid_count"] = len(decision.scores)
+            else:
+                frame["scores_p90"] = decision.scores
             frame["order_changed"] = frame["sorted_ids"] != ids
         except Exception as exc:
             frame["decision_ns"] = time.perf_counter_ns() - started
@@ -569,8 +611,9 @@ class AdmissionController:
                 frame["sorted_ids"] = tuple(r.request_id for r in ordered)
                 frame["order_changed"] = frame["sorted_ids"] != ids
                 frame["head_adjust_ns"] = time.perf_counter_ns() - adjust_start
-        for r in candidates:
-            r.r1_shadow_predicted = True
+        if self.config.head_policy != "length_sjf":
+            for r in candidates:
+                r.r1_shadow_predicted = True
         frame["reason"] = "success"
         if self.config.mode == "apply":
             started = time.perf_counter_ns()
@@ -583,7 +626,7 @@ class AdmissionController:
         snapshot = {"decision_batch_id": f"{self.instance_id}:{frame['schedule_id']}",
                     "scheduled_timestamp": timestamp, "running_count": running_count,
                     "kv_usage": kv_usage, "token_budget": int(token_budget)}
-        return snapshot, ids
+        return snapshot, (() if self.config.head_policy == "length_sjf" else ids)
 
     def attempt(self, frame, request):
         if request.request_id in frame["_candidate_set"]:
@@ -738,7 +781,7 @@ class AdmissionController:
         frame["actual_admission_order"] = frame["window_admitted"] + frame["tail_admitted"]
         if self.config.fairness_alternate:
             frame["fairness_alternate_turn_after"] = self.fairness_next
-        if self.config.head_policy == "type_slo":
+        if self.config.head_policy in ("type_slo", "length_sjf"):
             positions = {request_id: index for index, request_id in enumerate(frame["candidate_ids"])}
             admitted_positions = [positions[rid] for rid in frame["window_admitted"]]
             frame["actual_window_order_changed"] = admitted_positions != sorted(admitted_positions)
