@@ -189,6 +189,37 @@ class OpenAIServingCompletion(OpenAIServing):
                                    engine_prompt, request_id_item,
                                    lora_request, prompt_adapter_request)
 
+                ltr = getattr(self.engine_client, "r1_ltr", None)
+                if ltr is not None and not isinstance(sampling_params, BeamSearchParams):
+                    from vllm.v1.metrics.r1_ltr_predictor import LTR_INTERNAL_KEY
+                    if sampling_params.extra_args is None:
+                        sampling_params.extra_args = {}
+                    else:
+                        sampling_params.extra_args = dict(sampling_params.extra_args)
+                    sampling_params.extra_args.pop(LTR_INTERNAL_KEY, None)
+                    text_prompt = request_prompts[i].get("prompt")
+                    if (isinstance(text_prompt, str) and request.n == 1
+                            and not request.use_beam_search
+                            and lora_request is None and prompt_adapter_request is None
+                            and request.truncate_prompt_tokens is None
+                            and not request.add_special_tokens
+                            and not request.kv_transfer_params):
+                        try:
+                            scoring_start = time.perf_counter_ns()
+                            result = await ltr.score(
+                                request_id_item, text_prompt,
+                                self.engine_client.r1_ltr_timeout)
+                            sampling_params.extra_args[LTR_INTERNAL_KEY] = result
+                            logger.info("R1_LTR score request_id=%s tokenization_ns=%d inference_ns=%d foreground_ns=%d",
+                                        request_id_item, result.tokenization_ns,
+                                        result.inference_ns, time.perf_counter_ns() - scoring_start)
+                        except Exception as exc:
+                            logger.warning("R1_LTR score unavailable request_id=%s reason=%s",
+                                           request_id_item, type(exc).__name__)
+                    else:
+                        logger.info("R1_LTR score skipped request_id=%s reason=unsupported_request",
+                                    request_id_item)
+
                 self._log_inputs(request_id_item,
                                  request_prompts[i],
                                  params=sampling_params,

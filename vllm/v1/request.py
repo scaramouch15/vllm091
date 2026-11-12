@@ -33,6 +33,7 @@ class Request:
         cache_salt: Optional[str] = None,
         r1_shadow_lengths: Optional[tuple[float, float, float]] = None,
         r1_request_type: Optional[str] = None,
+        r1_ltr_score: Optional[float] = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -54,6 +55,8 @@ class Request:
         self.num_prompt_tokens = len(self.prompt_token_ids)
         self.r1_request_type = r1_request_type
         self.r1_shadow_lengths = r1_shadow_lengths
+        self.r1_ltr_score = r1_ltr_score
+        self.r1_ltr_admitted = False
         if r1_shadow_lengths is not None:
             self.r1_shadow_admitted = False
             self.r1_shadow_predicted = False
@@ -111,6 +114,7 @@ class Request:
                 sampling_params=request.sampling_params),
             cache_salt=request.cache_salt,
             r1_shadow_lengths=request.r1_shadow_lengths,
+            r1_ltr_score=getattr(request, "r1_ltr_score", None),
             r1_request_type=request.r1_request_type,
         )
 

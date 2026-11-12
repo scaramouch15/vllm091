@@ -200,12 +200,23 @@ class Scheduler(SchedulerInterface):
                 "VLLM_R1_ADMISSION_SKIP_SINGLE_SLOT" in os.environ or
                 "VLLM_R1_ADMISSION_HEAD_POLICY" in os.environ or
                 "VLLM_R1_ADMISSION_TIME_OBSERVE" in os.environ or
+                "VLLM_R1_LTR_ENABLE" in os.environ or
                 "VLLM_R1_SLO_SHADOW" in os.environ or
                 "VLLM_R1_FAIRNESS_COMPARE_OBSERVE" in os.environ or
                 "VLLM_R1_FAIRNESS_APPLY" in os.environ or
                 "VLLM_R1_FAIRNESS_ALTERNATE" in os.environ):
             from vllm.v1.core.sched.r1_admission import AdmissionConfig
             admission_config = AdmissionConfig.from_env()
+            ltr_flag = os.environ.get("VLLM_R1_LTR_ENABLE", "0")
+            if ltr_flag not in ("0", "1"):
+                raise ValueError("VLLM_R1_LTR_ENABLE must be 0 or 1")
+            if ltr_flag == "1" and (admission_config.mode not in ("observe", "apply")
+                                     or admission_config.head_policy != "paper_ltr"):
+                raise ValueError("LTR requires paper_ltr admission observe or apply")
+            if admission_config.head_policy == "paper_ltr" and admission_config.mode != "off":
+                if (ltr_flag != "1" or os.environ.get("VLLM_R1_SHADOW", "0") != "0"
+                        or os.environ.get("VLLM_R1_TYPE_SLO", "0") != "0"):
+                    raise ValueError("paper_ltr requires LTR enabled and shadow/type SLO disabled")
             if (admission_config.mode in ("observe", "apply") and
                     admission_config.head_policy.startswith("conditional_") and not self.log_stats):
                 raise ValueError("conditional head policy requires native log_stats")
@@ -232,14 +243,20 @@ class Scheduler(SchedulerInterface):
             from vllm.v1.core.sched.r1_admission import (AdmissionController,
                                                         unsupported_reason)
             reason = unsupported_reason(vllm_config)
-            if reason is None and self.r1_shadow is None:
+            if reason is None and self.r1_shadow is None and admission_config.head_policy != "paper_ltr":
                 reason = "shadow_disabled"
             if reason is not None:
                 logger.warning("R1 admission disabled; native fallback: %s", reason)
             else:
-                from vllm.v1.metrics.r1_shadow import valid_lengths
+                admission_sink = self.r1_shadow
+                valid_lengths = None
+                if admission_config.head_policy == "paper_ltr":
+                    from vllm.v1.metrics.r1_ltr_predictor import LTRAdmissionLogger
+                    admission_sink = LTRAdmissionLogger(logger)
+                else:
+                    from vllm.v1.metrics.r1_shadow import valid_lengths
                 self.r1_admission = AdmissionController(admission_config,
-                                                        self.r1_shadow, valid_lengths)
+                                                        admission_sink, valid_lengths)
 
     def schedule(self) -> SchedulerOutput:
         admission = getattr(self, "r1_admission", None)

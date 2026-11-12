@@ -71,6 +71,7 @@ class EngineCoreRequest(
     r1_shadow_lengths: Optional[tuple[float, float, float]] = None
     r1_request_type: Optional[str] = None
     r1_type_slo_instance: Optional[str] = None
+    r1_ltr_score: Optional[float] = None
 
 
 class EngineCoreEventType(enum.IntEnum):

@@ -333,6 +333,11 @@ class Processor:
                 sampling_params, len(decoder_inputs["prompt_token_ids"]),
                 getattr(self, "r1_shadow", None), request_id)
 
+        ltr_score = None
+        if sampling_params.extra_args and '_vllm_r1_ltr_score_v1' in sampling_params.extra_args:
+            from vllm.v1.metrics.r1_ltr_predictor import consume_score
+            ltr_score = consume_score(sampling_params, request_id)
+
         return decoder_inputs.get("prompt"), EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=decoder_inputs["prompt_token_ids"],
@@ -346,6 +351,7 @@ class Processor:
             cache_salt=decoder_inputs.get("cache_salt"),
             data_parallel_rank=data_parallel_rank,
             r1_shadow_lengths=shadow_lengths,
+            r1_ltr_score=ltr_score,
             r1_request_type=(sampling_params.extra_args or {}).pop(
                 "_vllm_r1_request_type", None),
             r1_type_slo_instance=(sampling_params.extra_args or {}).pop(

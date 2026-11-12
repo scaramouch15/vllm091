@@ -147,6 +147,40 @@ class AsyncLLM(EngineClient):
             from vllm.v1.metrics.r1_shadow import create_shadow
             self.r1_shadow = create_shadow(vllm_config, "frontend")
         self.processor.r1_shadow = self.r1_shadow
+        self.r1_ltr = None
+        ltr_enabled = os.environ.get("VLLM_R1_LTR_ENABLE", "0")
+        if ltr_enabled not in ("0", "1"):
+            raise ValueError("VLLM_R1_LTR_ENABLE must be 0 or 1")
+        if ltr_enabled == "1":
+            import math
+            if (os.environ.get("VLLM_R1_ADMISSION_MODE", "off") not in ("observe", "apply")
+                    or os.environ.get("VLLM_R1_ADMISSION_HEAD_POLICY") != "paper_ltr"
+                    or os.environ.get("VLLM_R1_SHADOW", "0") != "0"
+                    or os.environ.get("VLLM_R1_TYPE_SLO", "0") != "0"):
+                raise ValueError("LTR requires paper_ltr admission and shadow/type SLO disabled")
+            model = os.environ.get("VLLM_R1_LTR_MODEL_DIR", "")
+            tokenizer = os.environ.get("VLLM_R1_LTR_TOKENIZER_DIR", "")
+            timeout = float(os.environ.get("VLLM_R1_LTR_TIMEOUT_SECONDS", "5"))
+            max_inflight = int(os.environ.get("VLLM_R1_LTR_MAX_INFLIGHT", "8"))
+            if not model or not tokenizer or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError("LTR requires model and tokenizer paths and positive timeout")
+            from vllm.v1.metrics.r1_ltr_predictor import (BoundedAsyncLTRScorer,
+                                                         EXPECTED_MODEL_SHA256,
+                                                         MODEL_REVISION,
+                                                         TOKENIZER_SHA256,
+                                                         TOKENIZER_REVISION,
+                                                         PaperLTRScorer)
+            predictor = PaperLTRScorer(model, tokenizer)
+            self.r1_ltr = BoundedAsyncLTRScorer(predictor, max_inflight)
+            self.r1_ltr_timeout = timeout
+            logger.info("R1_LTR enabled model_sha256=%s model_revision=%s tokenizer_revision=%s device=cpu dtype=%s max_inflight=%d timeout_seconds=%s",
+                        EXPECTED_MODEL_SHA256, MODEL_REVISION, TOKENIZER_REVISION,
+                        next(predictor.model.parameters()).dtype, max_inflight, timeout)
+            import importlib.metadata
+            logger.info("R1_LTR dependencies python=%s torch=%s transformers=%s tokenizers=%s tokenizer_sha256=%s",
+                        __import__('sys').version.split()[0], predictor.torch.__version__,
+                        predictor.transformers_version,
+                        importlib.metadata.version('tokenizers'), TOKENIZER_SHA256)
         if self.stat_loggers:
             for stat_logger in self.stat_loggers[0]:
                 stat_logger.log_engine_initialized()
@@ -226,6 +260,8 @@ class AsyncLLM(EngineClient):
             if engine_core := getattr(self, "engine_core", None):
                 engine_core.shutdown()
         finally:
+            if ltr := getattr(self, "r1_ltr", None):
+                ltr.shutdown()
             if shadow := getattr(self, "r1_shadow", None):
                 shadow.close()
             if handler := getattr(self, "output_handler", None):

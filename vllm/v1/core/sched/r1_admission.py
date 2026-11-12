@@ -48,9 +48,11 @@ class AdmissionConfig:
             raise ValueError("feasible protection requires type_slo and finite positive multiplier")
         if self.slo_observation and self.head_policy == "length_sjf" and self.mode != "off":
             raise ValueError("SLO shadow observation is incompatible with length_sjf")
+        if self.slo_observation and self.head_policy == "paper_ltr" and self.mode != "off":
+            raise ValueError("SLO shadow observation is incompatible with paper_ltr")
         if self.slo_observation and self.mode != "observe":
             raise ValueError("SLO shadow observation requires admission mode observe")
-        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk", "type_slo", "length_sjf"):
+        if self.head_policy not in ("protected", "ranked", "conditional_wait", "conditional_risk", "type_slo", "length_sjf", "paper_ltr"):
             raise ValueError("invalid VLLM_R1_ADMISSION_HEAD_POLICY")
         if self.mode in ("observe", "apply") and self.head_policy != "protected" and self.skip_single_slot:
             raise ValueError("ranked or conditional head policy conflicts with SKIP_SINGLE_SLOT=1")
@@ -227,6 +229,9 @@ class AdmissionController:
                 "trigger_prefix_ns": 0, "prediction_ns": 0,
                 "decision_ns": 0, "apply_ns": 0, "restore_ns": 0,
                 "_candidates": (), "_candidate_set": frozenset(), "_applied": False}
+        if self.config.head_policy == "paper_ltr":
+            frame.update(score_rule="paper_ltr_higher_first_stable_v1",
+                         ltr_scores=(), ltr_cache_read_ns=0)
         if self.config.head_policy == "length_sjf":
             frame.update(score_rule="predicted_output_length_p50_sjf_v1",
                          length_p50_scores=(), length_valid_count=0,
@@ -263,6 +268,14 @@ class AdmissionController:
 
     def eligible(self, r):
         # Missing optional admitted flag is rejected, never defaulted to eligible.
+        if self.config.head_policy == "paper_ltr":
+            score = getattr(r, "r1_ltr_score", None)
+            return (r.status.name == "WAITING" and type(score) in (int, float)
+                    and math.isfinite(score) and getattr(r, "r1_ltr_admitted", None) is False
+                    and r.num_output_tokens == 0 and r.num_computed_tokens == 0
+                    and not r.has_encoder_inputs and not r.mm_inputs and not r.mm_positions
+                    and r.lora_request is None and not r.use_structured_output
+                    and r.kv_transfer_params is None)
         return (r.status.name == "WAITING" and self.valid_lengths(r.r1_shadow_lengths)
                 and getattr(r, "r1_shadow_admitted", None) is False
                 and r.num_output_tokens == 0 and r.num_computed_tokens == 0
@@ -347,6 +360,14 @@ class AdmissionController:
             frame["checked"] += 1
             if not self.eligible(r):
                 frame["prefix_stop"] = "ineligible"
+                if self.config.head_policy == "paper_ltr":
+                    score = getattr(r, "r1_ltr_score", None)
+                    frame["prefix_stop_detail"] = (
+                        "preempted" if r.status.name == "PREEMPTED" else
+                        "already_admitted" if getattr(r, "r1_ltr_admitted", False) else
+                        "special_status" if r.status.name != "WAITING" else
+                        "missing_or_invalid_ltr_score" if type(score) not in (int, float)
+                        or not math.isfinite(score) else "unsupported_request")
                 if self.config.head_policy == "length_sjf":
                     status = r.status.name
                     frame["prefix_stop_detail"] = (
@@ -411,21 +432,27 @@ class AdmissionController:
             if not math.isfinite(kv_usage) or not 0 <= kv_usage <= 1:
                 raise ValueError("invalid KV usage")
             frame["running_count"], frame["kv_usage"] = running_count, kv_usage
-            if self.config.head_policy == "length_sjf":
+            if self.config.head_policy == "paper_ltr":
+                decision = Decision(self.instance_id, frame["schedule_id"],
+                                    tuple(r.request_id for r in candidates),
+                                    tuple(r.r1_ltr_score for r in candidates))
+            elif self.config.head_policy == "length_sjf":
                 decision = self.make_length_decision(frame, candidates)
             else:
                 decision = self.make_decision(frame, candidates, running_count, kv_usage)
         except Exception as exc:
             elapsed = time.perf_counter_ns() - started
             timer = ("cached_length_read_ns" if self.config.head_policy == "length_sjf"
+                     else "ltr_cache_read_ns" if self.config.head_policy == "paper_ltr"
                      else "prediction_ns")
             frame[timer] = elapsed
-            frame["reason"] = ("snapshot_or_cached_length_failed"
+            frame["reason"] = ("snapshot_or_ltr_cache_failed" if self.config.head_policy == "paper_ltr" else "snapshot_or_cached_length_failed"
                                if self.config.head_policy == "length_sjf"
                                else "prediction_failed")
             frame["error_type"] = type(exc).__name__
             return None
         timer = ("cached_length_read_ns" if self.config.head_policy == "length_sjf"
+                 else "ltr_cache_read_ns" if self.config.head_policy == "paper_ltr"
                  else "prediction_ns")
         frame[timer] = time.perf_counter_ns() - started
         type_order = None
@@ -514,7 +541,7 @@ class AdmissionController:
                 frame["type_fallback"] = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
                 frame["reason"] = "type_prediction_or_decision_failed"
                 return None
-        if self.config.head_policy != "length_sjf":
+        if self.config.head_policy not in ("length_sjf", "paper_ltr"):
             self.prediction_successes += 1
         started = time.perf_counter_ns()
         try:
@@ -525,12 +552,14 @@ class AdmissionController:
                     or decision.candidate_ids != ids or len(set(ids)) != len(ids)
                     or len(decision.scores) != len(ids)
                     or any(isinstance(s, bool) or not isinstance(s, (float, int))
-                           or not math.isfinite(s) or s < 0 for s in decision.scores)
+                           or not math.isfinite(s) or (s < 0 and self.config.head_policy != "paper_ltr") for s in decision.scores)
                     or len(actual) != len(candidates)
                     or any(a is not b for a, b in zip(actual, candidates))):
                 raise ValueError("decision identity or prefix mismatch")
             if self.config.head_policy == "type_slo":
                 order = type_order
+            elif self.config.head_policy == "paper_ltr":
+                order = sorted(range(len(ids)), key=lambda i: (-decision.scores[i], i))
             elif self.config.head_policy == "protected":
                 order = [0, *sorted(range(1, len(ids)), key=lambda i: (decision.scores[i], i))]
             else:
@@ -544,6 +573,10 @@ class AdmissionController:
                     raise ValueError("cached output-length prediction changed")
                 frame["length_p50_scores"] = decision.scores
                 frame["length_valid_count"] = len(decision.scores)
+            elif self.config.head_policy == "paper_ltr":
+                if any(r.r1_ltr_score != score for r, score in zip(candidates, decision.scores)):
+                    raise ValueError("cached LTR score changed")
+                frame["ltr_scores"] = decision.scores
             else:
                 frame["scores_p90"] = decision.scores
             frame["order_changed"] = frame["sorted_ids"] != ids
@@ -611,7 +644,7 @@ class AdmissionController:
                 frame["sorted_ids"] = tuple(r.request_id for r in ordered)
                 frame["order_changed"] = frame["sorted_ids"] != ids
                 frame["head_adjust_ns"] = time.perf_counter_ns() - adjust_start
-        if self.config.head_policy != "length_sjf":
+        if self.config.head_policy not in ("length_sjf", "paper_ltr"):
             for r in candidates:
                 r.r1_shadow_predicted = True
         frame["reason"] = "success"
@@ -626,7 +659,7 @@ class AdmissionController:
         snapshot = {"decision_batch_id": f"{self.instance_id}:{frame['schedule_id']}",
                     "scheduled_timestamp": timestamp, "running_count": running_count,
                     "kv_usage": kv_usage, "token_budget": int(token_budget)}
-        return snapshot, (() if self.config.head_policy == "length_sjf" else ids)
+        return snapshot, (() if self.config.head_policy in ("length_sjf", "paper_ltr") else ids)
 
     def attempt(self, frame, request):
         if request.request_id in frame["_candidate_set"]:
@@ -637,6 +670,8 @@ class AdmissionController:
     def admitted(self, frame, request):
         key = "window_admitted" if request.request_id in frame["_candidate_set"] else "tail_admitted"
         frame[key].append(request.request_id)
+        if self.config.head_policy == "paper_ltr":
+            request.r1_ltr_admitted = True
         if (self.config.fairness_alternate and key == "window_admitted"
                 and frame.get("_applied") and frame.get("fairness_alternate_competing")):
             advanced = frame["_fairness_advanced"]
@@ -781,7 +816,7 @@ class AdmissionController:
         frame["actual_admission_order"] = frame["window_admitted"] + frame["tail_admitted"]
         if self.config.fairness_alternate:
             frame["fairness_alternate_turn_after"] = self.fairness_next
-        if self.config.head_policy in ("type_slo", "length_sjf"):
+        if self.config.head_policy in ("type_slo", "length_sjf", "paper_ltr"):
             positions = {request_id: index for index, request_id in enumerate(frame["candidate_ids"])}
             admitted_positions = [positions[rid] for rid in frame["window_admitted"]]
             frame["actual_window_order_changed"] = admitted_positions != sorted(admitted_positions)
