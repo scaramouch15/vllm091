@@ -39,7 +39,7 @@ def run(mode, tokenizer, outdir):
     raw.write_text(json.dumps({'query':'Write a Python function to add two integers.', 'lang':'python','resource':'local-validation'})+'\n',encoding='utf8')
     env=os.environ.copy(); env['PYTHONPATH']=str(ROOT/'tools/jitserve_client_validation/shim')
     env['HF_HUB_OFFLINE']='1'; env['TRANSFORMERS_OFFLINE']='1'
-    cmd=[sys.executable, str(ROOT/'benchmarks/benchmark_serving.py'), '--backend','jitserve', '--endpoint','/generate', '--host','127.0.0.1', '--port',str(server.server_port), '--model',str(tokenizer), '--dataset-name','mixed', '--mixed-code-path',str(raw), '--mixed-code-count','1', '--mixed-output-len','2048', '--num-prompts','1', '--request-rate','8', '--max-concurrency','32', '--disable-tqdm', '--goodput-by-type','chat.ttft:2000','chat.tpot:30','code.e2el:30000','summary.e2el:20000', '--goodput-by-type-output',str(result)]
+    cmd=[sys.executable, str(ROOT/'benchmarks/benchmark_serving.py'), '--backend','jitserve', '--endpoint','/generate', '--host','127.0.0.1', '--port',str(server.server_port), '--model',str(tokenizer), '--dataset-name','mixed', '--mixed-code-path',str(raw), '--mixed-code-count','1', '--mixed-output-len','2048', '--temperature','0.9', '--num-prompts','1', '--request-rate','8', '--max-concurrency','32', '--disable-tqdm', '--goodput-by-type','chat.ttft:2000','chat.tpot:30','code.e2el:30000','summary.e2el:20000', '--goodput-by-type-output',str(result)]
     try:
         proc=subprocess.run(cmd,cwd=ROOT,env=env,capture_output=True,text=True,encoding='utf8',errors='replace',timeout=180)
     finally:
@@ -56,6 +56,7 @@ def run(mode, tokenizer, outdir):
         assert payload['request_info']['request_type']==1
         assert payload['slo_constraint']==[0.0,0.0,30.0]
         assert payload['sampling_params']['max_tokens']==2048
+        assert payload['sampling_params']['temperature']==0.9
         assert 'output_len' not in payload['request_info']
         assert 'target_output_length' not in payload and 'target_output_length' not in payload['sampling_params']
     summary=data['summary']['types']['code']

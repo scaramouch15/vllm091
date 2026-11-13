@@ -4,7 +4,7 @@
 
 ## 已验证与未验证
 
-- 本地替身 HTTP 服务运行实际 `benchmarks/benchmark_serving.py`：正常和断流各一轮，每轮 1 probe + 1 正式 Code，ID 可区分；正常轮分母 1、达标 1，断流轮分母 1、成功及达标均为 0。请求为 THROUGHPUT、`[0,0,30]`、`max_tokens=2048`，没有真实目标长度；正常轮最终 token 数采用替身提供的 11。空记录后延迟发非空输出的测试确认首个空记录不触发 TTFT。
+- 本地替身 HTTP 服务运行实际 `benchmarks/benchmark_serving.py`（`--temperature 0.9`）：正常和断流各一轮，每轮 1 probe + 1 正式 Code，ID 可区分；正常轮分母 1、达标 1，断流轮分母 1、成功及达标均为 0。请求为 THROUGHPUT、`[0,0,30]`、`max_tokens=2048`、probe 和正式请求的 temperature 均为 0.9，没有真实目标长度；正常轮最终 token 数采用替身提供的 11。空记录后延迟发非空输出的测试确认首个空记录不触发 TTFT。
 - HTTP backend 替身单测 3 项、probe/正式请求 benchmark 主循环单测 1 项和服务端 stop-checker 替身单测 3 项通过。服务端测试覆盖提前 EOS、上限、旧定长模式。这些不验证真实服务或吞吐性能。
 - 真实 A800 单请求：**未执行**。正式 120 条对照：**未执行**。首次发送前取消/进程中断不保证登记为正式 attempt；不完整运行应判无效。
 - 本地仅测试了非目标测试 tokenizer，两个 `add_special_tokens=False` 输入路径的完整 ID 一致；Meta-Llama-3-8B-Instruct tokenizer、两端版本、完整 token ID、BOS 和模板 token 仍需服务器预检。
@@ -48,7 +48,7 @@ cd "$CLIENT"
   --endpoint /generate --host 127.0.0.1 --port 8000 --model "$MODEL" \
   --dataset-name mixed --mixed-code-path "$CODE_JSONL" \
   --mixed-code-count 1 --mixed-chat-count 0 --mixed-summary-count 0 \
-  --mixed-output-len 2048 --num-prompts 1 --request-rate 8 --max-concurrency 32 \
+  --mixed-output-len 2048 --temperature 0.9 --num-prompts 1 --request-rate 8 --max-concurrency 32 \
   --goodput-by-type chat.ttft:2000 chat.tpot:30 code.e2el:30000 summary.e2el:20000 \
   --goodput-by-type-output /tmp/jitserve-code-score.json 2>&1 | tee /tmp/jitserve-code-client.log
 ```

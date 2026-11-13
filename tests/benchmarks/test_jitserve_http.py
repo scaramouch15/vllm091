@@ -49,6 +49,17 @@ class BackendTest(unittest.IsolatedAsyncioTestCase):
             out = await self.run_req(response)
             self.assertFalse(out.success)
             self.assertTrue(out.error)
+    def test_sampling_validation(self):
+        self.assertEqual(backend.jitserve_sampling_params(None), {'temperature': 0.0})
+        self.assertEqual(backend.jitserve_sampling_params({'temperature': 0.9, 'top_p': 0.95, 'top_k': 5, 'min_p': 0.1, 'add_special_tokens': False}),
+                         {'temperature': 0.9, 'top_p': 0.95, 'top_k': 5, 'min_p': 0.1})
+        for extra in ({'temperature': -1}, {'temperature': float('nan')},
+                      {'temperature': float('inf')}, {'top_p': 0}, {'top_k': 0},
+                      {'min_p': 2}, {'target_output_length': 42},
+                      {'add_special_tokens': True}, {'ignore_eos': True}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                backend.jitserve_sampling_params(extra)
+
     async def test_all_types(self):
         for kind, expected in [('chat', [2.,.03,0.]), ('summary',[0.,0.,20.])]:
             out = await self.run_req(Response(200,[rec('x',True)]), kind)

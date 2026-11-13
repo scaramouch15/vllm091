@@ -44,6 +44,7 @@ from backend_request_func import (
     OPENAI_COMPATIBLE_BACKENDS,
     RequestFuncInput,
     RequestFuncOutput,
+    jitserve_sampling_params,
 )
 
 try:
@@ -924,8 +925,10 @@ def main(args: argparse.Namespace):
         if v is not None
     }
 
-    # Sampling parameters are only supported by openai-compatible backend.
-    if sampling_params and args.backend not in OPENAI_COMPATIBLE_BACKENDS:
+    # JITServe validates its supported sampling parameters separately.
+    if args.backend == "jitserve":
+        jitserve_sampling_params(sampling_params)
+    elif sampling_params and args.backend not in OPENAI_COMPATIBLE_BACKENDS:
         raise ValueError(
             "Sampling parameters are only supported by openai-compatible backends."
         )
@@ -1384,26 +1387,26 @@ if __name__ == "__main__":
         "--top-p",
         type=float,
         default=None,
-        help="Top-p sampling parameter. Only has effect on openai-compatible backends.",
+        help="Top-p sampling parameter. Only has effect on openai-compatible and jitserve backends.",
     )
     sampling_group.add_argument(
         "--top-k",
         type=int,
         default=None,
-        help="Top-k sampling parameter. Only has effect on openai-compatible backends.",
+        help="Top-k sampling parameter. Only has effect on openai-compatible and jitserve backends.",
     )
     sampling_group.add_argument(
         "--min-p",
         type=float,
         default=None,
-        help="Min-p sampling parameter. Only has effect on openai-compatible backends.",
+        help="Min-p sampling parameter. Only has effect on openai-compatible and jitserve backends.",
     )
     sampling_group.add_argument(
         "--temperature",
         type=float,
         default=None,
         help="Temperature sampling parameter. Only has effect on "
-        "openai-compatible backends. If not specified, default to greedy "
+        "openai-compatible and jitserve backends. If not specified, default to greedy "
         "decoding (i.e. temperature==0.0).",
     )
 

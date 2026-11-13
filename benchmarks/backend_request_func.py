@@ -3,6 +3,7 @@
 
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -619,6 +620,33 @@ def get_tokenizer(
         )
 
 
+def jitserve_sampling_params(extra: Optional[dict]) -> dict:
+    """Validate the CLI sampling subset supported by JITServe SamplingParams."""
+    extra = extra or {}
+    allowed = {"temperature", "top_p", "top_k", "min_p", "add_special_tokens"}
+    if set(extra) - allowed or extra.get("add_special_tokens", False) is not False:
+        raise ValueError("unsupported JITServe sampling parameter or special-token mode")
+    params = {"temperature": extra.get("temperature", 0.0)}
+    for key in ("top_p", "top_k", "min_p"):
+        if key in extra:
+            params[key] = extra[key]
+    for key in ("temperature", "top_p", "min_p"):
+        if key in params:
+            value = params[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"JITServe {key} must be a finite number")
+    if params["temperature"] < 0:
+        raise ValueError("JITServe temperature must be non-negative")
+    if "top_p" in params and not 0 < params["top_p"] <= 1:
+        raise ValueError("JITServe top_p must be in (0, 1]")
+    if "min_p" in params and not 0 <= params["min_p"] <= 1:
+        raise ValueError("JITServe min_p must be in [0, 1]")
+    if "top_k" in params and (type(params["top_k"]) is not int or
+                               params["top_k"] == 0 or params["top_k"] < -1):
+        raise ValueError("JITServe top_k must be -1 or a positive integer")
+    return params
+
+
 async def async_request_jitserve(request_func_input: RequestFuncInput,
                                  pbar: Optional[tqdm] = None) -> RequestFuncOutput:
     """Natural-mode JITServe adapter; requires the explicitly patched server."""
@@ -628,19 +656,16 @@ async def async_request_jitserve(request_func_input: RequestFuncInput,
                "code": (1, [0.0, 0.0, 30.0]),
                "summary": (1, [0.0, 0.0, 20.0])}
     kind = request_func_input.task_type
-    extra = request_func_input.extra_body or {}
-    if (kind not in mapping or request_func_input.ignore_eos or
-            set(extra) - {"temperature", "add_special_tokens"} or
-            extra.get("temperature", 0.0) != 0.0 or
-            extra.get("add_special_tokens", False) is not False):
-        raise ValueError("jitserve requires mixed type, greedy sampling, and natural EOS")
+    if kind not in mapping or request_func_input.ignore_eos:
+        raise ValueError("jitserve requires a mixed task type and natural EOS")
+    sampling = jitserve_sampling_params(request_func_input.extra_body)
     req_type, slo = mapping[kind]
     payload = {"request_info": {"prompt": request_func_input.prompt,
                "prompt_len": request_func_input.prompt_len, "request_type": req_type,
                "collection_id": 0, "deadline": slo[2], "natural_generation": True,
                "request_id": request_func_input.request_id or uuid.uuid4().hex},
                "sampling_params": {"max_tokens": request_func_input.output_len,
-                                   "temperature": 0.0},
+                                   **sampling},
                "slo_constraint": slo, "stream": True}
     buffer = bytearray()
     previous = ""
