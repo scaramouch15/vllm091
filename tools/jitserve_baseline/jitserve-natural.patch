@@ -1,0 +1,129 @@
+diff --git a/jitserve/request_info.py b/jitserve/request_info.py
+index 7d9a026..248cd4e 100644
+--- a/jitserve/request_info.py
++++ b/jitserve/request_info.py
+@@ -93,7 +93,10 @@ class RequestInfo:
+         client_id = json_obj.get("client_id", 0)  # Default to 0 if not provided
+         collection_id = json_obj["collection_id"]
+         deadline = json_obj["deadline"]
+-        output_len = json_obj["output_len"]
++        natural_generation = json_obj.get("natural_generation", False)
++        output_len = 1024 if natural_generation else json_obj["output_len"]
++        if natural_generation and "output_len" in json_obj:
++            raise ValueError("natural generation does not accept output_len")
+         input_len = json_obj.get("prompt_len", json_obj.get("input_len", 0))  # Support both field names
+         prompt = json_obj.get("prompt", "")
+         output = json_obj.get("output", "")
+@@ -102,8 +105,11 @@ class RequestInfo:
+         state = json_obj.get("state", "")
+         
+         # Return a new instance of RequestInfo with the extracted values
+-        return cls(request_type, slo_constraint, client_id, collection_id, deadline, input_len, output_len,
+-                  None, prompt, output, stage_id, request_id, state)
++        info = cls(request_type, slo_constraint, client_id, collection_id, deadline, input_len, output_len,
++                   None, prompt, output, stage_id, request_id, state)
++        if natural_generation:
++            info.real_output_len = None
++        return info
+     
+     def to_dict(self) -> Dict[str, Any]:
+         """Convert RequestInfo to dictionary format."""
+diff --git a/jitserve/server.py b/jitserve/server.py
+index 64f3657..add8fa6 100644
+--- a/jitserve/server.py
++++ b/jitserve/server.py
+@@ -99,6 +99,9 @@ def predict_and_update_request_info(request_info: RequestInfo, text: str,
+     if decoded_len > 0:
+         bound = max(bound, decoded_len + refine_interval)
+     request_info.output_len = bound
++    if hasattr(request_info, "observation_id"):
++        logger.info("natural_prediction id=%s decoded=%d estimate=%d success=%s",
++                    request_info.observation_id, decoded_len, bound, bool(result and result[0] >= 0))
+ 
+ 
+ def _build_sampling_params(request_dict: Dict[str, Any]) -> SamplingParams:
+@@ -231,6 +234,10 @@ async def generate(request: Request) -> Response:
+     - other fields: the sampling parameters (See `SamplingParams` for details).
+     """
+     request_dict = await request.json()
++    natural = request_dict.get("request_info", {}).get("natural_generation", False)
++    if natural and ("predicted_output_len" in request_dict or "target_output_length" in request_dict or
++                    "target_output_length" in request_dict.get("sampling_params", {})):
++        return JSONResponse({"error": "natural mode forbids target_output_length"}, status_code=400)
+     stream = request_dict.pop("stream", False)
+     client_id = request_dict.get("client_id", 0)
+ 
+@@ -240,9 +247,15 @@ async def generate(request: Request) -> Response:
+     sampling_params = _build_sampling_params(request_dict)
+     request_info, prompt = _build_request_info(request_dict, client_id)
+     _apply_request_deadline(request_info, request_dict)
++    request_id = random_uuid()
++    if natural:
++        request_info.observation_id = request_id
+     _maybe_start_prediction(request_info, prompt, predicted_len)
+ 
+-    request_id = random_uuid()
++    if natural:
++        logger.info("natural_request id=%s client_id=%s type=%s deadline=%s prediction_enabled=%s estimate=%s",
++                    request_id, request_info.request_id, request_info.request_type.name, request_info.deadline,
++                    use_prediction, request_info.output_len)
+     is_deepresearch = False
+     collection_id = request_info.collection_id
+     if request_info.request_type == RequestType.COLLECTIVE:
+@@ -250,7 +263,9 @@ async def generate(request: Request) -> Response:
+             request_info, request_dict, prompt)
+ 
+     assert engine is not None
+-    results_generator = engine.generate(prompt, request_info, 
++    engine_prompt = ({"prompt_token_ids": generation_tokenizer.encode(prompt, add_special_tokens=False)}
++                     if natural else prompt)
++    results_generator = engine.generate(engine_prompt, request_info,
+                                         sampling_params, request_id, client_id=request_info.client_id)
+     results_generator = iterate_with_cancellation(
+         results_generator, is_cancelled=request.is_disconnected)
+@@ -279,16 +294,20 @@ async def generate(request: Request) -> Response:
+         request_input_length = 0
+         request_output_length = 0
+         async for request_output in results_generator:
+-            prompt = request_output.prompt
++            output_prompt = prompt if natural else request_output.prompt
+             request_input_length = len(request_output.prompt_token_ids)
+-            assert prompt is not None
++            assert output_prompt is not None
+             text_outputs = [
+-                prompt + output.text for output in request_output.outputs
++                output_prompt + output.text for output in request_output.outputs
+             ]
+             request_output_length = sum([len(output.token_ids) for output in request_output.outputs])
+             
+             ret = {"text": text_outputs, "ttft": request_output.ttft,
+                    "tbt": request_output.tbt, "service_gain": request_output.service_gain}
++            if natural:
++                ret.update(request_id=request_id, finished=request_output.finished,
++                           finish_reason=request_output.outputs[0].finish_reason if request_output.outputs else None,
++                           output_tokens=request_output_length)
+             yield (json.dumps(ret) + "\0").encode("utf-8")
+             
+         # Track collection completion for graph learning (regardless of matching mode)
+diff --git a/third_party/vllm/vllm/engine/output_processor/stop_checker.py b/third_party/vllm/vllm/engine/output_processor/stop_checker.py
+index 6390c97..e3b0311 100644
+--- a/third_party/vllm/vllm/engine/output_processor/stop_checker.py
++++ b/third_party/vllm/vllm/engine/output_processor/stop_checker.py
+@@ -51,7 +51,7 @@ class StopChecker:
+         # Check if the sequence has reached the target output length.
+         if ((not sampling_params.ignore_eos)
+                 and seq.get_last_token_id() == seq.eos_token_id):
+-            if seq.get_output_len() >= seq.real_output_len:
++            if seq.real_output_len is None or seq.get_output_len() >= seq.real_output_len:
+                 # Remove the last EOS token unless explicitly specified
+                 # This prevents unintended exposure of the EOS token
+                 if new_char_count and (
+@@ -63,7 +63,7 @@ class StopChecker:
+             seq.stop_reason = seq.eos_token_id
+             return
+ 
+-        if seq.get_output_len() >= seq.real_output_len:
++        if seq.real_output_len is not None and seq.get_output_len() >= seq.real_output_len:
+             # If the sequence has reached its real output length,
+             # we consider it finished.
+             seq.status = SequenceStatus.FINISHED_STOPPED

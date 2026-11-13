@@ -364,6 +364,7 @@ async def benchmark(
         logprobs=logprobs,
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
+        task_type=input_requests[0].metadata["task_type"] if backend == "jitserve" else None,
         extra_body=({**(extra_body or {}), "r1_request_type": input_requests[0].metadata["task_type"]}
                     if r1_type_slo else extra_body),
     )
@@ -435,6 +436,9 @@ async def benchmark(
                     formal_attempts.append(identity)
                     sent = True
                 request_func_input.r1_type_attempt = record_attempt
+            if backend == "jitserve" and identity is not None:
+                import uuid
+                request_func_input.request_id = uuid.uuid4().hex
             output = await request_func(request_func_input=request_func_input, pbar=pbar)
             if identity is not None and sent:
                 length = output.output_tokens
@@ -445,7 +449,11 @@ async def benchmark(
                     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
                 record = {"success": output.success, "error": output.error,
                           "latency_s": valid_number(output.latency),
-                          "ttft_s": valid_number(output.ttft), "output_tokens": length}
+                          "ttft_s": valid_number(output.ttft), "output_tokens": length,
+                          "engine_request_id": output.engine_request_id, "finish_reason": output.finish_reason,
+                          "client_request_id": request_func_input.request_id,
+                          "sent_at_perf_counter": output.sent_at, "first_at_perf_counter": output.first_at,
+                          "completed_at_perf_counter": output.completed_at}
                 type_log.emit("result", request_id=identity["request_id"], result=record)
                 type_results[identity["request_id"]] = record
             return output
@@ -479,6 +487,7 @@ async def benchmark(
             logprobs=logprobs,
             multi_modal_content=mm_content,
             ignore_eos=ignore_eos,
+            task_type=request.metadata["task_type"] if backend == "jitserve" else None,
             extra_body=({**(extra_body or {}), "r1_request_type": request.metadata["task_type"]}
                         if r1_type_slo else extra_body),
         )
@@ -759,7 +768,17 @@ def main(args: argparse.Namespace):
         )
 
     if args.dataset_name == "mixed":
-        input_requests = mixed_dataset.sample(tokenizer, args.num_prompts)
+        approved_path = getattr(args, "mixed_approved_manifest", None)
+        approved_split = getattr(args, "mixed_approved_split", None)
+        if bool(approved_path) != bool(approved_split):
+            raise ValueError("mixed approved manifest and split must be provided together")
+        if approved_path:
+            from r1_prefill_manifest import read_json, replay
+            input_requests = replay(read_json(approved_path), mixed_dataset, tokenizer,
+                                    str(tokenizer_id), tokenizer_mode, approved_split)
+            args.num_prompts = len(input_requests)
+        else:
+            input_requests = mixed_dataset.sample(tokenizer, args.num_prompts)
         if args.mixed_export_path:
             mixed_dataset.export(
                 args.mixed_export_path,

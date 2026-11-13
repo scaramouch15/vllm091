@@ -58,12 +58,17 @@ def add_mixed_dataset_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional JSON inspection manifest, written before sending requests.",
     )
+    group.add_argument("--mixed-approved-manifest", default=None,
+                       help="Replay a checked R1 candidate manifest and split.")
+    group.add_argument("--mixed-approved-split", choices=("train", "calibration", "test"),
+                       default=None, help="Approved manifest split to replay.")
 
 
 def mixed_dataset_from_args(args: argparse.Namespace) -> "MixedWorkloadDataset":
-    if args.backend not in ("vllm", "openai") or args.endpoint != "/v1/completions":
+    if not ((args.backend in ("vllm", "openai") and args.endpoint == "/v1/completions") or
+            (args.backend == "jitserve" and args.endpoint == "/generate")):
         raise ValueError(
-            "mixed supports --backend vllm/openai with --endpoint /v1/completions"
+            "mixed supports vllm/openai completions or jitserve /generate"
         )
     dataset = MixedWorkloadDataset(
         **{f"{task}_path": getattr(args, f"mixed_{task}_path") for task in TASKS},

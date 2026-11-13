@@ -37,6 +37,7 @@ class RequestFuncInput:
     request_id: Optional[str] = None
     collection_context: Optional[Any] = None
     r1_type_attempt: Optional[Any] = None
+    task_type: Optional[str] = None
 
 
 @dataclass
@@ -50,6 +51,11 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    engine_request_id: Optional[str] = None
+    finish_reason: Optional[str] = None
+    sent_at: Optional[float] = None
+    first_at: Optional[float] = None
+    completed_at: Optional[float] = None
 
 
 async def async_request_tgi(
@@ -613,7 +619,94 @@ def get_tokenizer(
         )
 
 
+async def async_request_jitserve(request_func_input: RequestFuncInput,
+                                 pbar: Optional[tqdm] = None) -> RequestFuncOutput:
+    """Natural-mode JITServe adapter; requires the explicitly patched server."""
+    import uuid
+    out = RequestFuncOutput(prompt_len=request_func_input.prompt_len)
+    mapping = {"chat": (0, [2.0, .03, 0.0]),
+               "code": (1, [0.0, 0.0, 30.0]),
+               "summary": (1, [0.0, 0.0, 20.0])}
+    kind = request_func_input.task_type
+    extra = request_func_input.extra_body or {}
+    if (kind not in mapping or request_func_input.ignore_eos or
+            set(extra) - {"temperature", "add_special_tokens"} or
+            extra.get("temperature", 0.0) != 0.0 or
+            extra.get("add_special_tokens", False) is not False):
+        raise ValueError("jitserve requires mixed type, greedy sampling, and natural EOS")
+    req_type, slo = mapping[kind]
+    payload = {"request_info": {"prompt": request_func_input.prompt,
+               "prompt_len": request_func_input.prompt_len, "request_type": req_type,
+               "collection_id": 0, "deadline": slo[2], "natural_generation": True,
+               "request_id": request_func_input.request_id or uuid.uuid4().hex},
+               "sampling_params": {"max_tokens": request_func_input.output_len,
+                                   "temperature": 0.0},
+               "slo_constraint": slo, "stream": True}
+    buffer = bytearray()
+    previous = ""
+    finished = False
+    first = None
+    try:
+        async with aiohttp.ClientSession(trust_env=True, timeout=AIOHTTP_TIMEOUT) as session:
+            st = time.perf_counter()
+            out.sent_at = st
+            last = st
+            if request_func_input.r1_type_attempt is not None:
+                request_func_input.r1_type_attempt()
+            async with session.post(request_func_input.api_url, json=payload) as response:
+                if response.status != 200:
+                    raise ValueError(f"HTTP {response.status}: {response.reason}")
+                async for chunk in response.content.iter_any():
+                    buffer.extend(chunk)
+                    while b"\0" in buffer:
+                        raw, _, rest = buffer.partition(b"\0")
+                        buffer = bytearray(rest)
+                        if finished:
+                            raise ValueError("record after completion")
+                        data = json.loads(raw.decode("utf-8"))
+                        texts = data.get("text")
+                        if not isinstance(texts, list) or len(texts) != 1 or not isinstance(texts[0], str) or not texts[0].startswith(request_func_input.prompt):
+                            raise ValueError("invalid cumulative response")
+                        text = texts[0][len(request_func_input.prompt):]
+                        if not text.startswith(previous):
+                            raise ValueError("non-cumulative response")
+                        engine_id = data.get("request_id")
+                        if not isinstance(engine_id, str) or not engine_id or (out.engine_request_id and engine_id != out.engine_request_id):
+                            raise ValueError("missing or changed engine request ID")
+                        out.engine_request_id = engine_id
+                        count = data.get("output_tokens")
+                        if type(count) is not int or count < 0:
+                            raise ValueError("missing output token count")
+                        now = time.perf_counter()
+                        if text != previous:
+                            if first is None:
+                                first = now
+                                out.ttft = now - st
+                                out.first_at = now
+                            else:
+                                out.itl.append(now - last)
+                            last = now
+                        previous = text
+                        if data.get("finished") is True:
+                            finished = True
+                            out.output_tokens = count
+                            out.finish_reason = data.get("finish_reason")
+                            last = now
+                if buffer or not finished or first is None:
+                    raise ValueError("incomplete stream or no visible generated content")
+                out.generated_text = previous
+                out.latency = last - st
+                out.completed_at = last
+                out.success = True
+    except Exception:
+        out.error = traceback.format_exc()
+    if pbar:
+        pbar.update(1)
+    return out
+
+
 ASYNC_REQUEST_FUNCS = {
+    "jitserve": async_request_jitserve,
     "tgi": async_request_tgi,
     "vllm": async_request_openai_completions,
     "lmdeploy": async_request_openai_completions,
