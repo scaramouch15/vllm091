@@ -37,3 +37,11 @@ Completion 的预处理返回标准化文本；仅单文本、单输出、无 be
 ## 验证限制
 
 真实 checkpoint CPU 检查、mock Scheduler 方法测试、AST 提取的实际 Processor 方法测试和真实 msgspec 字节编码／子进程 echo 测试分别报告；它们不证明完整 EngineCore IPC 或 GPU 服务运行。作者 AUXLLM GPU 路径尚未直接验证。由于配置和 tokenization、模型数值可能在目标环境不同，服务器复测前须先核对模型和 tokenizer 摘要、Python/torch/transformers/tokenizers/safetensors 版本、代码提交及导入路径，并验证日志是否完整。现有训练身份清单无法证实 LTR 与 seed=1/2 无重叠。无法由本适配宣称吞吐、Goodput、SLO 或公平性收益。
+
+## 评分诊断字段（diagnostic_v1）
+
+`R1_LTR diagnostic_v1` 以 request_id 记录 `submitted`、`worker_started` 和 `worker_finished` / `worker_failed`。`queue_wait_ns` 从提交前采样到 worker 开始，包含线程调度和提交记账，不是精确的纯队列时间；正常结束另记录 `tokenizer_ns`、`inference_ns`。调用方超时或取消时，`caller_exit` 包含稳定 reason、`foreground_ns` 和该瞬间的 `still_running`；worker 后续结束的 `late` 表示在结束记账时已观察到调用方退出。两条日志是并发事件，不是资源事务回滚。评分器维持原有单 worker、有界在途量，超时后的运行任务仍占容量直至结束，结果不会转交其他请求。
+
+completion 失败原因使用稳定值 `queue_full`、`duplicate_request_id`、`scorer_closed`、`invalid_score_identity`、`timeout`、`cancelled` 和 `model_exception`；后者额外记录异常类型，不记录原始异常消息或 prompt。服务端仍用普通 Python 日志，日志等级、缓冲和丢失不受 shadow JSONL footer/丢失计数机制保证；按请求 ID 联合客户端 attempt/result 和 admission 记录统计缺失、重复及未关联，并明确日志完整性仍未知。
+
+`cpu_queue_diagnostic.py` 是使用固定合成文本和真实 checkpoint 的本机 CPU 比较工具，需单独提供模型路径、tokenizer 路径与新输出路径；输出每次请求、worker 事件、线程数及机器信息。它使用一个 worker、有限在途数和超时，不代表 GPU 服务或不同节点的运行成本。CPU 的瞬时突发实验不能独立确定生产参数。

@@ -4,10 +4,23 @@ This module is not wired into the API or scheduler yet. It has no import-time
 model loading and does not download model/tokenizer resources.
 """
 import hashlib
+import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _diagnostic(level, message, *args):
+    """Diagnostics must not turn a successful model call into a failure."""
+    try:
+        logger.log(level, message, *args)
+    except Exception:
+        # Ordinary logging has no durable loss counter; audit its absence.
+        pass
 
 EXPECTED_MODEL_SHA256 = 'e7739d26217ee23eb14b6282ee5088f9c79bdc477f456c027b7ebcffacde61ab'
 MODEL_REVISION = '39df2b41ffe88d5ed967c6035d3838b5b5960379'
@@ -87,6 +100,23 @@ class ScoringUnavailable(RuntimeError):
     """An LTR score could not be obtained safely for this request."""
 
 
+class ModelExecutionTimeout(RuntimeError):
+    """A model raised TimeoutError; this is not the caller's deadline."""
+
+
+def scoring_failure_reason(exc):
+    import asyncio
+    if isinstance(exc, asyncio.CancelledError):
+        return 'cancelled'
+    if isinstance(exc, asyncio.TimeoutError):
+        return 'timeout'
+    known = {'queue_full', 'duplicate_request_id', 'scorer_closed',
+             'invalid_score_identity'}
+    if isinstance(exc, ScoringUnavailable) and str(exc) in known:
+        return str(exc)
+    return 'model_exception'
+
+
 class BoundedAsyncLTRScorer:
     """Bounded single-worker adapter; not yet attached to the API lifecycle.
 
@@ -124,6 +154,8 @@ class BoundedAsyncLTRScorer:
         # Reserve the ID before the first await so duplicate callers cannot race.
         self._ids.add(request_id)
         started = time.monotonic()
+        submitted_ns = time.perf_counter_ns()
+        late = threading.Event()
         try:
             await asyncio.wait_for(self._permits.acquire(), timeout_seconds)
         except BaseException:
@@ -134,8 +166,28 @@ class BoundedAsyncLTRScorer:
             self._ids.remove(request_id)
             raise ScoringUnavailable('scorer_closed')
         loop = asyncio.get_running_loop()
+        def run_job():
+            worker_start = time.perf_counter_ns()
+            _diagnostic(logging.INFO, "R1_LTR diagnostic_v1 request_id=%s event=worker_started queue_wait_ns=%d",
+                        request_id, worker_start - submitted_ns)
+            try:
+                result = self._scorer.score(request_id, prompt)
+                if isinstance(result, ScoreResult):
+                    _diagnostic(logging.INFO, "R1_LTR diagnostic_v1 request_id=%s event=worker_finished tokenizer_ns=%s inference_ns=%s late=%s",
+                                request_id, result.tokenization_ns, result.inference_ns, late.is_set())
+                else:
+                    _diagnostic(logging.WARNING, "R1_LTR diagnostic_v1 request_id=%s event=worker_finished invalid_result=true late=%s",
+                                   request_id, late.is_set())
+                return result
+            except Exception as exc:
+                _diagnostic(logging.WARNING, "R1_LTR diagnostic_v1 request_id=%s event=worker_failed error_type=%s late=%s",
+                               request_id, type(exc).__name__, late.is_set())
+                if isinstance(exc, TimeoutError):
+                    raise ModelExecutionTimeout('model_raised_timeout') from exc
+                raise
         try:
-            job = self._executor.submit(self._scorer.score, request_id, prompt)
+            _diagnostic(logging.INFO, "R1_LTR diagnostic_v1 request_id=%s event=submitted", request_id)
+            job = self._executor.submit(run_job)
         except BaseException:
             self._permits.release()
             self._ids.remove(request_id)
@@ -159,10 +211,17 @@ class BoundedAsyncLTRScorer:
         try:
             result = await asyncio.wait_for(
                 asyncio.shield(wrapped), max(0.0, remaining))
-        except BaseException:
+        except BaseException as exc:
             # This succeeds only before the worker starts; running work completes
             # in the sole worker and is discarded by the cancelled caller.
+            late.set()
+            was_running = job.running()
             job.cancel()
+            _diagnostic(logging.INFO, "R1_LTR diagnostic_v1 request_id=%s event=caller_exit reason=%s error_type=%s foreground_ns=%d still_running=%s",
+                        request_id, 'cancelled' if isinstance(exc, asyncio.CancelledError)
+                        else 'timeout' if isinstance(exc, asyncio.TimeoutError) else 'model_exception',
+                        type(exc).__name__,
+                        time.perf_counter_ns() - submitted_ns, was_running)
             raise
         if (not isinstance(result, ScoreResult) or result.request_id != request_id
                 or type(result.score) not in (int, float)

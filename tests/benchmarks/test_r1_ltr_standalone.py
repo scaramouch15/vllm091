@@ -118,3 +118,91 @@ class AsyncCancellationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await worker.close()
+
+class DiagnosticReasonTests(unittest.TestCase):
+    def test_reasons_are_stable_and_do_not_expose_exception_message(self):
+        import asyncio
+        for text in ('queue_full','duplicate_request_id','scorer_closed','invalid_score_identity'):
+            self.assertEqual(module.scoring_failure_reason(module.ScoringUnavailable(text)),text)
+        self.assertEqual(module.scoring_failure_reason(asyncio.TimeoutError()),'timeout')
+        self.assertEqual(module.scoring_failure_reason(asyncio.CancelledError()),'cancelled')
+        self.assertEqual(module.scoring_failure_reason(ValueError('private prompt')),'model_exception')
+        self.assertEqual(module.scoring_failure_reason(module.ScoringUnavailable('private prompt')),'model_exception')
+
+class DiagnosticEventsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_finishes_after_timeout_with_identity_and_timings(self):
+        import asyncio
+        import threading
+        started, release = threading.Event(), threading.Event()
+        class Fake:
+            def score(self, request_id, prompt):
+                started.set(); release.wait(2)
+                return module.ScoreResult(request_id, 2., 17, 31)
+        scorer=module.BoundedAsyncLTRScorer(Fake(),1)
+        try:
+            with self.assertLogs(module.logger,level='INFO') as logs:
+                task=asyncio.create_task(scorer.score('test-id','private prompt',0.05))
+                await asyncio.to_thread(started.wait,1)
+                with self.assertRaises(asyncio.TimeoutError): await task
+                release.set()
+                await scorer.close()
+            text='\n'.join(logs.output)
+            self.assertIn('event=submitted',text)
+            self.assertIn('event=worker_started queue_wait_ns=',text)
+            self.assertIn('reason=timeout',text)
+            self.assertIn('still_running=True',text)
+            self.assertIn('event=worker_finished tokenizer_ns=17 inference_ns=31 late=True',text)
+            self.assertNotIn('private prompt',text)
+        finally:
+            release.set()
+            await scorer.close()
+
+class DiagnosticFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_failure_records_type_not_private_message(self):
+        class Fake:
+            def score(self, request_id, prompt):
+                raise ValueError('private prompt')
+        scorer=module.BoundedAsyncLTRScorer(Fake(),1)
+        try:
+            with self.assertLogs(module.logger,level='INFO') as logs:
+                with self.assertRaises(ValueError):
+                    await scorer.score('safe-id','private prompt',1)
+                await scorer.close()
+            text='\n'.join(logs.output)
+            self.assertIn('event=worker_failed error_type=ValueError',text)
+            self.assertNotIn('private prompt',text)
+        finally:
+            await scorer.close()
+
+    async def test_closed_scorer_rejects(self):
+        scorer=module.BoundedAsyncLTRScorer(object(),1)
+        await scorer.close()
+        with self.assertRaisesRegex(module.ScoringUnavailable,'scorer_closed'):
+            await scorer.score('safe-id','text',1)
+
+class DiagnosticSinkFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_logging_failure_does_not_change_score(self):
+        from unittest.mock import patch
+        class Fake:
+            def score(self, request_id, prompt):
+                return module.ScoreResult(request_id, 2., 1, 1)
+        scorer=module.BoundedAsyncLTRScorer(Fake(),1)
+        try:
+            with patch.object(module.logger,'log',side_effect=OSError('sink failed')):
+                result=await scorer.score('safe-id','text',1)
+            self.assertEqual((result.request_id,result.score),('safe-id',2.))
+        finally:
+            await scorer.close()
+
+class ModelTimeoutReasonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_timeout_is_not_caller_deadline(self):
+        class Fake:
+            def score(self, request_id, prompt):
+                raise TimeoutError('sensitive')
+        scorer=module.BoundedAsyncLTRScorer(Fake(),1)
+        try:
+            with self.assertRaises(module.ModelExecutionTimeout) as caught:
+                await scorer.score('safe-id','text',1)
+            self.assertEqual(module.scoring_failure_reason(caught.exception),'model_exception')
+        finally:
+            await scorer.close()

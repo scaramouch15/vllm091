@@ -191,7 +191,8 @@ class OpenAIServingCompletion(OpenAIServing):
 
                 ltr = getattr(self.engine_client, "r1_ltr", None)
                 if ltr is not None and not isinstance(sampling_params, BeamSearchParams):
-                    from vllm.v1.metrics.r1_ltr_predictor import LTR_INTERNAL_KEY
+                    from vllm.v1.metrics.r1_ltr_predictor import (LTR_INTERNAL_KEY,
+                                                                 scoring_failure_reason)
                     if sampling_params.extra_args is None:
                         sampling_params.extra_args = {}
                     else:
@@ -204,8 +205,8 @@ class OpenAIServingCompletion(OpenAIServing):
                             and request.truncate_prompt_tokens is None
                             and not request.add_special_tokens
                             and not request.kv_transfer_params):
+                        scoring_start = time.perf_counter_ns()
                         try:
-                            scoring_start = time.perf_counter_ns()
                             result = await ltr.score(
                                 request_id_item, text_prompt,
                                 self.engine_client.r1_ltr_timeout)
@@ -213,9 +214,15 @@ class OpenAIServingCompletion(OpenAIServing):
                             logger.info("R1_LTR score request_id=%s tokenization_ns=%d inference_ns=%d foreground_ns=%d",
                                         request_id_item, result.tokenization_ns,
                                         result.inference_ns, time.perf_counter_ns() - scoring_start)
+                        except asyncio.CancelledError:
+                            logger.info("R1_LTR score unavailable request_id=%s reason=cancelled foreground_ns=%d",
+                                        request_id_item, time.perf_counter_ns() - scoring_start)
+                            raise
                         except Exception as exc:
-                            logger.warning("R1_LTR score unavailable request_id=%s reason=%s",
-                                           request_id_item, type(exc).__name__)
+                            reason = scoring_failure_reason(exc)
+                            logger.warning("R1_LTR score unavailable request_id=%s reason=%s error_type=%s foreground_ns=%d",
+                                           request_id_item, reason, type(exc).__name__,
+                                           time.perf_counter_ns() - scoring_start)
                     else:
                         logger.info("R1_LTR score skipped request_id=%s reason=unsupported_request",
                                     request_id_item)
