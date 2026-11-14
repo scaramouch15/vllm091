@@ -25,8 +25,20 @@ class AdmissionConfig:
     fairness_wait_limit_seconds: float = None
     fairness_apply: bool = False
     fairness_alternate: bool = False
+    feasible_order: str = "normalized"
+    critical_horizon_seconds: float = None
 
     def __post_init__(self):
+        if self.feasible_order not in ("normalized", "absolute", "critical"):
+            raise ValueError("invalid VLLM_R1_FEASIBLE_ORDER")
+        if self.feasible_order != "normalized" and not (
+                self.fairness_apply and self.fairness_alternate):
+            raise ValueError("alternative feasible order requires fairness alternation")
+        if self.feasible_order == "critical" and (
+                type(self.critical_horizon_seconds) not in (int, float) or
+                not math.isfinite(self.critical_horizon_seconds) or
+                self.critical_horizon_seconds <= 0):
+            raise ValueError("critical order requires positive finite horizon")
         if self.fairness_alternate and not self.fairness_apply:
             raise ValueError("fairness alternate requires fairness apply")
         if self.fairness_apply and (
@@ -113,6 +125,13 @@ class AdmissionConfig:
         fairness_alternate = os.environ.get("VLLM_R1_FAIRNESS_ALTERNATE", "0")
         if fairness_alternate not in ("0", "1"):
             raise ValueError("FAIRNESS_ALTERNATE must be 0 or 1")
+        feasible_order = os.environ.get("VLLM_R1_FEASIBLE_ORDER", "normalized")
+        horizon = None
+        if feasible_order == "critical":
+            try:
+                horizon = float(os.environ["VLLM_R1_CRITICAL_HORIZON_SECONDS"])
+            except (KeyError, ValueError) as exc:
+                raise ValueError("critical horizon must be explicit and numeric") from exc
         fairness_wait = None
         if compare == "1" or fairness_apply == "1":
             try:
@@ -121,7 +140,8 @@ class AdmissionConfig:
                 raise ValueError("FAIRNESS_WAIT_LIMIT_SECONDS must be explicit and numeric") from exc
         return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget,
                    slo_observation == "1", feasible == "1", multiplier,
-                   compare == "1", fairness_wait, fairness_apply == "1", fairness_alternate == "1")
+                   compare == "1", fairness_wait, fairness_apply == "1", fairness_alternate == "1",
+                   feasible_order, horizon)
 
 
 def observe_fairness_order(rows, wait_limit):
@@ -136,16 +156,32 @@ def observe_fairness_order(rows, wait_limit):
     return branch, tuple(r["request_id"] for r in ordered)
 
 
-def alternate_fairness_order(rows, wait_limit, turn):
+def feasible_sort_key(row, mode, horizon):
+    if mode == "normalized":
+        return (row["score"], row["position"])
+    slack = row["slo_s"] - row["wait_s"] - row["prediction_p90_s"]
+    if mode == "absolute":
+        return (slack, row["position"])
+    return (0 if slack <= horizon else 1,
+            slack if slack <= horizon else row["score"], row["position"])
+
+
+def alternate_fairness_order(rows, wait_limit, turn, feasible_order="normalized", horizon=None):
     """Interleave competing groups; preserve existing ordering within each group."""
     protected = sorted((r for r in rows if r["wait_s"] >= wait_limit), key=lambda r: r["position"])
     feasible = sorted((r for r in rows if r["wait_s"] < wait_limit and r["score"] >= 0),
-                      key=lambda r: (r["score"], r["position"]))
+                      key=lambda r: feasible_sort_key(r, feasible_order, horizon))
     infeasible = sorted((r for r in rows if r["wait_s"] < wait_limit and r["score"] < 0),
                         key=lambda r: r["position"])
     competing = bool(protected and feasible)
     if not competing:
         branch, ids = observe_fairness_order(rows, wait_limit)
+        if feasible_order != "normalized":
+            by_id = {r["request_id"]: r for r in rows}
+            ordered = [by_id[i] for i in ids]
+            start = len(protected)
+            ordered[start:start + len(feasible)] = feasible
+            ids = tuple(r["request_id"] for r in ordered)
         return branch, ids, False
     groups = {"protected": protected, "feasible": feasible}
     order = []
@@ -436,7 +472,10 @@ class AdmissionController:
                             raise ValueError("fairness_candidate_identity_mismatch")
                         if self.config.fairness_alternate:
                             branch, alternate, competing = alternate_fairness_order(
-                                rows, self.config.fairness_wait_limit_seconds, self.fairness_next)
+                                rows, self.config.fairness_wait_limit_seconds, self.fairness_next,
+                                self.config.feasible_order, self.config.critical_horizon_seconds)
+                            frame["feasible_order"] = self.config.feasible_order
+                            frame["critical_horizon_seconds"] = self.config.critical_horizon_seconds
                             frame["fairness_alternate_competing"] = competing
                             frame["fairness_alternate_turn_before"] = self.fairness_next
                             if competing:

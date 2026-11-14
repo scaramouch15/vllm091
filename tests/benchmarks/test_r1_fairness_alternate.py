@@ -22,6 +22,20 @@ class AlternateTests(unittest.TestCase):
         self.assertEqual(A.alternate_fairness_order(rows,30,'protected'),('alternate',('p1','f2','p2','f1','i'),True))
         self.assertEqual(A.alternate_fairness_order(rows[:1],30,'feasible')[1],('p1',))
 
+    def test_feasible_order_uses_absolute_slack_without_changing_groups(self):
+        rows = [dict(request_id='code', position=0, wait_s=15.95, score=.139,
+                     slo_s=30., prediction_p90_s=9.89),
+                dict(request_id='chat', position=1, wait_s=1.389, score=.254,
+                     slo_s=2., prediction_p90_s=.103),
+                dict(request_id='protected', position=2, wait_s=31., score=-1.)]
+        self.assertEqual(A.alternate_fairness_order(rows, 30., 'feasible')[1][0], 'code')
+        self.assertEqual(A.alternate_fairness_order(rows, 30., 'feasible', 'absolute')[1],
+                         ('chat', 'protected', 'code'))
+        self.assertEqual(A.alternate_fairness_order(rows, 30., 'feasible', 'critical', .6)[1],
+                         ('chat', 'protected', 'code'))
+        self.assertEqual(A.alternate_fairness_order(rows[:2], 30., 'feasible', 'absolute')[1],
+                         ('chat', 'code'))
+
     def test_one_slot_switches_only_after_actual_admission(self):
         h,obj,w = self.setup_case(); obj.max_num_running_reqs=1
         h.run100(obj); e=h.event(w)
