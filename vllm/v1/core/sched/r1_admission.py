@@ -162,12 +162,23 @@ def feasible_sort_key(row, mode, horizon):
     slack = row["slo_s"] - row["wait_s"] - row["prediction_p90_s"]
     if mode == "absolute":
         return (slack, row["position"])
+    if mode != "critical":
+        raise ValueError("invalid VLLM_R1_FEASIBLE_ORDER")
     return (0 if slack <= horizon else 1,
             slack if slack <= horizon else row["score"], row["position"])
 
 
 def alternate_fairness_order(rows, wait_limit, turn, feasible_order="normalized", horizon=None):
-    """Interleave competing groups; preserve existing ordering within each group."""
+    """Interleave groups; only the feasible group's internal key is selectable.
+
+    Critical requests have slack <= the explicitly configured horizon in seconds;
+    no observed or future admission interval is used as that horizon.
+    """
+    if feasible_order not in ("normalized", "absolute", "critical"):
+        raise ValueError("invalid VLLM_R1_FEASIBLE_ORDER")
+    if feasible_order == "critical" and (
+            type(horizon) not in (int, float) or not math.isfinite(horizon) or horizon <= 0):
+        raise ValueError("critical order requires positive finite horizon")
     protected = sorted((r for r in rows if r["wait_s"] >= wait_limit), key=lambda r: r["position"])
     feasible = sorted((r for r in rows if r["wait_s"] < wait_limit and r["score"] >= 0),
                       key=lambda r: feasible_sort_key(r, feasible_order, horizon))
