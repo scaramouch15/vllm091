@@ -203,7 +203,8 @@ class Scheduler(SchedulerInterface):
                 "VLLM_R1_SLO_SHADOW" in os.environ or
                 "VLLM_R1_FAIRNESS_COMPARE_OBSERVE" in os.environ or
                 "VLLM_R1_FAIRNESS_APPLY" in os.environ or
-                "VLLM_R1_FAIRNESS_ALTERNATE" in os.environ):
+                "VLLM_R1_FAIRNESS_ALTERNATE" in os.environ or
+                "VLLM_R1_CRITICAL_DEFER_ONCE" in os.environ):
             from vllm.v1.core.sched.r1_admission import AdmissionConfig
             admission_config = AdmissionConfig.from_env()
             if (admission_config.mode in ("observe", "apply") and
@@ -648,6 +649,10 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.extendleft(skipped_waiting_requests)
+
+        if admission_frame is not None and admission.config.critical_variant != "A":
+            admission.observe_batch(scheduled_timestamp, bool(scheduled_new_reqs),
+                                    bool(self.waiting))
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

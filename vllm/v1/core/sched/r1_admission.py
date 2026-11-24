@@ -1,4 +1,6 @@
 """Opt-in RC1 waiting admission experiment; CPU prediction is provided by shadow."""
+from collections import deque
+from statistics import median
 from dataclasses import dataclass
 from itertools import islice
 import math
@@ -27,8 +29,20 @@ class AdmissionConfig:
     fairness_alternate: bool = False
     feasible_order: str = "normalized"
     critical_horizon_seconds: float = None
+    critical_defer_once: bool = False
+
+    critical_variant: str = "A"
 
     def __post_init__(self):
+        if self.critical_variant not in ("A", "B", "C"):
+            raise ValueError("VLLM_R1_CRITICAL_VARIANT must be A, B or C")
+        if self.critical_variant != "A" and not self.critical_defer_once:
+            raise ValueError("B and C require critical defer once")
+        if self.critical_defer_once and not (
+                self.mode == "apply" and self.head_policy == "type_slo" and
+                self.fairness_apply and self.fairness_alternate and
+                self.feasible_order == "critical"):
+            raise ValueError("critical defer once requires critical fairness apply alternation")
         if self.feasible_order not in ("normalized", "absolute", "critical"):
             raise ValueError("invalid VLLM_R1_FEASIBLE_ORDER")
         if self.feasible_order != "normalized" and not (
@@ -138,10 +152,14 @@ class AdmissionConfig:
                 fairness_wait = float(os.environ["VLLM_R1_FAIRNESS_WAIT_LIMIT_SECONDS"])
             except (KeyError, ValueError) as exc:
                 raise ValueError("FAIRNESS_WAIT_LIMIT_SECONDS must be explicit and numeric") from exc
+        defer_once = os.environ.get("VLLM_R1_CRITICAL_DEFER_ONCE", "0")
+        if defer_once not in ("0", "1"):
+            raise ValueError("CRITICAL_DEFER_ONCE must be 0 or 1")
         return cls(mode, every, limit, skip == "1", head_policy, timing == "1", wait, budget,
                    slo_observation == "1", feasible == "1", multiplier,
                    compare == "1", fairness_wait, fairness_apply == "1", fairness_alternate == "1",
-                   feasible_order, horizon)
+                   feasible_order, horizon, defer_once == "1",
+                   os.environ.get("VLLM_R1_CRITICAL_VARIANT", "A"))
 
 
 def observe_fairness_order(rows, wait_limit):
@@ -168,11 +186,11 @@ def feasible_sort_key(row, mode, horizon):
             slack if slack <= horizon else row["score"], row["position"])
 
 
-def alternate_fairness_order(rows, wait_limit, turn, feasible_order="normalized", horizon=None):
+def alternate_fairness_order(rows, wait_limit, turn, feasible_order="normalized", horizon=None,
+                             group_policy="alternate"):
     """Interleave groups; only the feasible group's internal key is selectable.
 
-    Critical requests have slack <= the explicitly configured horizon in seconds;
-    no observed or future admission interval is used as that horizon.
+    The caller supplies the horizon in seconds.
     """
     if feasible_order not in ("normalized", "absolute", "critical"):
         raise ValueError("invalid VLLM_R1_FEASIBLE_ORDER")
@@ -194,6 +212,8 @@ def alternate_fairness_order(rows, wait_limit, turn, feasible_order="normalized"
             ordered[start:start + len(feasible)] = feasible
             ids = tuple(r["request_id"] for r in ordered)
         return branch, ids, False
+    if group_policy == "feasible_first":
+        return "feasible_first", tuple(r["request_id"] for r in feasible + protected + infeasible), True
     groups = {"protected": protected, "feasible": feasible}
     order = []
     while groups["protected"] and groups["feasible"]:
@@ -249,6 +269,46 @@ class AdmissionController:
         self.instance_id = uuid.uuid4().hex
         self.schedules = self.opportunities = self.prediction_successes = 0
         self.fairness_next = "feasible"
+        self.deferred_protected = None
+        self.extra_bypass_used = False
+        self.admission_intervals = deque(maxlen=16)
+        self.last_batch_time = None
+        self.interval_median = None
+        self.short_enabled = os.environ.get("VLLM_R1_SHORT_HORIZON") == "1"
+        self.delay_order_mode = os.environ.get("VLLM_R1_DELAY_ORDER", "off")
+        if self.delay_order_mode not in ("off", "shadow", "apply"):
+            raise ValueError("VLLM_R1_DELAY_ORDER must be off, shadow, or apply")
+        if self.delay_order_mode != "off" and (
+                self.short_enabled or config.critical_variant != "C"
+                or not config.fairness_apply or not config.fairness_alternate
+                or not config.critical_defer_once or config.mode != "apply"):
+            raise ValueError("Delay order requires Critical C apply with fairness/defer and SHORT_HORIZON=0")
+        self.group_policy = os.environ.get("VLLM_R1_GROUP_POLICY", "alternate")
+        if self.group_policy not in ("alternate", "feasible_first"):
+            raise ValueError("invalid VLLM_R1_GROUP_POLICY")
+        if self.group_policy == "feasible_first" and (
+                config.critical_variant != "C" or config.mode != "apply"
+                or not config.fairness_apply or not config.fairness_alternate
+                or self.short_enabled or self.delay_order_mode != "off"):
+            raise ValueError("feasible_first requires plain Critical C with fairness enabled")
+        self.short_previous = None
+        self.short_gaps = deque(maxlen=16)
+        self.capacity_observe = os.environ.get("VLLM_R1_CAPACITY_OBSERVE", "0") == "1"
+
+    def observe_batch(self, timestamp, admitted_new, still_waiting):
+        if (self.short_enabled or self.delay_order_mode != "off") and admitted_new:
+            if self.short_previous is not None:
+                self.short_gaps.append(timestamp - self.short_previous)
+            self.short_previous = timestamp
+        if not still_waiting:
+            self.admission_intervals.clear()
+            self.last_batch_time = self.interval_median = None
+        elif admitted_new:
+            if self.last_batch_time is not None and timestamp > self.last_batch_time:
+                self.admission_intervals.append(timestamp - self.last_batch_time)
+                if len(self.admission_intervals) == self.admission_intervals.maxlen:
+                    self.interval_median = median(self.admission_intervals)
+            self.last_batch_time = timestamp
 
     def begin(self):
         self.schedules += 1
@@ -300,6 +360,13 @@ class AdmissionController:
                              fairness_compare_branch=None, fairness_compare_order_ids=(),
                              fairness_compare_order_changed=None, fairness_compare_vs_plan_changed=None,
                              fairness_compare_error=None, fairness_compare_ns=0)
+        if self.config.critical_defer_once:
+            frame.update(critical_defer_once=True, critical_defer_action="none",
+                         critical_defer_pending_before=(self.deferred_protected.request_id
+                             if self.deferred_protected is not None else None),
+                         critical_defer_protected_id=None, critical_defer_selected_id=None,
+                         critical_defer_committed=False, critical_defer_repaid=False,
+                         critical_defer_cleared=None)
         return frame
 
     def eligible(self, r):
@@ -339,12 +406,76 @@ class AdmissionController:
                                      or not math.isfinite(x) or x < 0 for x in row)
                     or list(row) != sorted(row)):
                 raise ValueError("invalid predicted quantiles")
+        if self.capacity_observe:
+            try:
+                frame["_capacity_time_quantiles"] = tuple(tuple(q) for q in values)
+            except Exception as exc:
+                frame["capacity_capture_error"] = type(exc).__name__
         return Decision(self.instance_id, frame["schedule_id"],
                         tuple(r.request_id for r in candidates),
                         tuple(row[1] for row in values))
 
+    def observe_capacity(self, frame, scheduler, candidates, timestamp):
+        """Read-only snapshot before waiting admission; never a remaining-time prediction.
+
+        Computed tokens reflect state at the scheduling boundary, not GPU work
+        completed in the current iteration. No token IDs or prompt text are logged.
+        """
+        started = time.perf_counter_ns()
+        try:
+            def snapshot(req):
+                lengths = getattr(req, "r1_shadow_lengths", None)
+                valid = (lengths is not None and self.valid_lengths(lengths))
+                return {
+                    "request_id": req.request_id,
+                    "request_type": getattr(req, "r1_request_type", None),
+                    "status": req.status.name,
+                    "num_prompt_tokens": req.num_prompt_tokens,
+                    "num_output_tokens": req.num_output_tokens,
+                    "num_computed_tokens": req.num_computed_tokens,
+                    "max_tokens": req.max_tokens,
+                    "first_queued_timestamp_s": getattr(req, "r1_first_queued_timestamp", None),
+                    "length_quantiles_tokens": tuple(lengths) if valid else None,
+                    "length_prediction_status": "available" if valid else "unavailable",
+                }
+            quantiles = frame["_capacity_time_quantiles"]
+            if len(quantiles) != len(candidates):
+                raise ValueError("capacity candidate length mismatch")
+            pending = []
+            for req, q in zip(candidates, quantiles):
+                item = snapshot(req)
+                item["admission_to_completion_quantiles_s"] = q
+                pending.append(item)
+            frame["capacity_observation_v1"] = {
+                "schema_version": 1,
+                "status": "complete",
+                "timestamp_s": timestamp,
+                "phase": "after_running_scheduling_before_waiting_admission",
+                "quantile_levels": (0.5, 0.9, 0.95),
+                "running_remaining_estimate_status": "not_computed",
+                "max_num_running_reqs": scheduler.max_num_running_reqs,
+                "available_running_slots": frame["available_running_slots"],
+                "token_budget": frame["token_budget"],
+                "kv_usage": frame["kv_usage"],
+                "running": [snapshot(req) for req in scheduler.running],
+                "candidates": pending,
+            }
+        except Exception as exc:
+            frame["capacity_observation_v1"] = {
+                "schema_version": 1, "status": "error", "error_type": type(exc).__name__}
+        finally:
+            frame["capacity_observation_ns"] = time.perf_counter_ns() - started
+
     def prepare(self, scheduler, frame, preempted, token_budget, timestamp):
         start = time.perf_counter_ns()
+        if self.config.critical_defer_once and self.deferred_protected is not None:
+            pending = self.deferred_protected
+            if scheduler.requests.get(pending.request_id) is not pending:
+                self.deferred_protected = None
+                frame["critical_defer_cleared"] = "request_removed"
+            elif pending.status.name != "WAITING" or pending.r1_shadow_admitted:
+                self.deferred_protected = None
+                frame["critical_defer_cleared"] = "no_longer_initial_waiting"
         if self.config.slo_observation:
             state = getattr(scheduler, "r1_type_slo", None)
             frame["_slo_config_error"] = None
@@ -442,6 +573,8 @@ class AdmissionController:
             frame["error_type"] = type(exc).__name__
             return None
         frame["prediction_ns"] = time.perf_counter_ns() - started
+        if self.capacity_observe:
+            self.observe_capacity(frame, scheduler, candidates, timestamp)
         type_order = None
         if self.config.head_policy == "type_slo":
             started = time.perf_counter_ns()
@@ -482,11 +615,16 @@ class AdmissionController:
                                 tuple(row["position"] for row in rows) != tuple(range(len(ids)))):
                             raise ValueError("fairness_candidate_identity_mismatch")
                         if self.config.fairness_alternate:
+                            horizon = self.config.critical_horizon_seconds
+                            if self.config.critical_variant != "A":
+                                horizon = self.interval_median or horizon
+                                frame["critical_variant"] = self.config.critical_variant
+                                frame["critical_interval_count"] = len(self.admission_intervals)
                             branch, alternate, competing = alternate_fairness_order(
                                 rows, self.config.fairness_wait_limit_seconds, self.fairness_next,
-                                self.config.feasible_order, self.config.critical_horizon_seconds)
+                                self.config.feasible_order, horizon, self.group_policy)
                             frame["feasible_order"] = self.config.feasible_order
-                            frame["critical_horizon_seconds"] = self.config.critical_horizon_seconds
+                            frame["critical_horizon_seconds"] = horizon
                             frame["fairness_alternate_competing"] = competing
                             frame["fairness_alternate_turn_before"] = self.fairness_next
                             if competing:
@@ -498,6 +636,12 @@ class AdmissionController:
                         else:
                             branch, alternate = observe_fairness_order(
                                 rows, self.config.fairness_wait_limit_seconds)
+                        if self.config.critical_defer_once:
+                            alternate = self.plan_critical_deferral(frame, rows, alternate)
+                        if self.short_enabled and self.config.critical_variant == "C":
+                            alternate = self.short_horizon_order(frame, rows, alternate, branch, timestamp)
+                        if self.delay_order_mode != "off":
+                            alternate = self.delay_cost_order(frame, rows, alternate, branch)
                         if len(alternate) != len(ids) or set(alternate) != set(ids):
                             raise ValueError("fairness_order_identity_mismatch")
                         by_id = {row["request_id"]: row for row in rows}
@@ -635,6 +779,149 @@ class AdmissionController:
                     "kv_usage": kv_usage, "token_budget": int(token_budget)}
         return snapshot, ids
 
+    def delay_cost_order(self, frame, rows, order, branch):
+        if (branch != "feasible" or frame["available_running_slots"] != 1
+                or frame.get("critical_defer_action") != "none" or len(order) < 2
+                or len(self.short_gaps) < 16 or min(self.short_gaps) <= 0):
+            return order
+        started = time.perf_counter_ns()
+        gap = median(self.short_gaps)
+        by_id = {row["request_id"]: row for row in rows}
+        margins = []
+        for rid in order[:4]:
+            row = by_id[rid]
+            prediction = row.get("prediction_p90_s")
+            if row["protected"] or prediction is None:
+                break
+            margin = row["slo_s"] - row["wait_s"] - prediction
+            if not math.isfinite(margin):
+                break
+            margins.append(margin)
+        if len(margins) < 2:
+            return order
+
+        best_position = best_delta = best_gain = best_loss = loss = 0
+        for position in range(1, len(margins)):
+            displaced = margins[position - 1]
+            loss += int((position - 1) * gap <= displaced < position * gap)
+            gain = int(0 <= margins[position] < position * gap)
+            if gain - loss > best_delta:
+                best_position, best_delta = position, gain - loss
+                best_gain, best_loss = gain, loss
+
+        frame["delay_cost_order"] = {
+            "mode": self.delay_order_mode,
+            "original": order[0],
+            "selected": order[best_position],
+            "selected_position": best_position,
+            "historical_gap_s": gap,
+            "candidate_count": len(margins),
+            "proxy_gain": best_gain,
+            "proxy_loss": best_loss,
+            "proxy_delta": best_delta,
+            "elapsed_ns": time.perf_counter_ns() - started,
+        }
+        if self.delay_order_mode == "apply" and best_position:
+            return ((order[best_position],) + order[:best_position]
+                    + order[best_position + 1:])
+        return order
+
+    def short_horizon_order(self, frame, rows, order, branch, timestamp):
+        if (branch != "feasible" or frame["available_running_slots"] != 1
+                or frame.get("critical_defer_action") != "none" or not order
+                or self.short_previous is None):
+            return order
+        gaps = (*self.short_gaps, timestamp - self.short_previous)[-16:]
+        if len(gaps) != 16 or min(gaps) <= 0:
+            return order
+        by_id = {row["request_id"]: row for row in rows}
+        scores = {}
+        slack = {}
+        for rid in order:
+            row = by_id[rid]
+            prediction = row.get("prediction_p90_s")
+            if row["protected"] or prediction is None:
+                continue
+            margin = row["slo_s"] - row["wait_s"] - prediction
+            if math.isfinite(margin):
+                slack[rid] = margin
+                scores[rid] = sum(gap > margin for gap in gaps) if margin >= 0 else 0
+        head = order[0]
+        if head not in scores:
+            return order
+        best = max(scores, key=scores.get)
+        frame["short_horizon"] = dict(original=head, selected=best,
+            original_type=by_id[head]["request_type"], selected_type=by_id[best]["request_type"],
+            original_slack_s=slack[head], selected_slack_s=slack[best],
+            original_count=scores[head], selected_count=scores[best], samples=len(gaps))
+        return (best,) + tuple(i for i in order if i != best) if best != head else order
+
+    def plan_critical_deferral(self, frame, rows, order):
+        """Reorder only the validated prefix; commit debt only upon admission."""
+        pending = self.deferred_protected
+        if pending is not None:
+            if pending.request_id in order:
+                frame["critical_defer_action"] = "repay_planned"
+                frame["critical_defer_protected_id"] = pending.request_id
+                order = (pending.request_id,) + tuple(i for i in order if i != pending.request_id)
+                if self.config.critical_variant == "C" and not self.extra_bypass_used:
+                    return self.plan_expired_bypass(frame, rows, order)
+                return order
+            frame["critical_defer_action"] = "pending_outside_prefix"
+            return order
+        if self.config.critical_variant == "C":
+            return self.plan_expired_bypass(frame, rows, order)
+        if (frame["available_running_slots"] != 1 or
+                not frame.get("fairness_alternate_competing") or
+                self.fairness_next != "protected"):
+            return order
+        by_id = {r["request_id"]: r for r in rows}
+        head = by_id[order[0]]
+        limit = self.config.fairness_wait_limit_seconds
+        if head["wait_s"] < limit:
+            return order
+        critical = [by_id[i] for i in order
+                    if by_id[i]["wait_s"] < limit and by_id[i]["score"] >= 0
+                    and 0 <= (by_id[i]["slo_s"] - by_id[i]["wait_s"] -
+                              by_id[i]["prediction_p90_s"]) <= frame["critical_horizon_seconds"]]
+        if not critical:
+            return order
+        selected = critical[0]["request_id"]
+        frame.update(critical_defer_action="bypass_planned",
+                     critical_defer_protected_id=order[0],
+                     critical_defer_selected_id=selected)
+        frame["_defer_protected_request"] = next(
+            r for r in frame["_candidates"] if r.request_id == order[0])
+        return (selected,) + tuple(i for i in order if i != selected)
+
+    def plan_expired_bypass(self, frame, rows, order):
+        slots = frame["available_running_slots"]
+        if not order or slots < 1 or slots >= len(order):
+            return order
+        by_id = {row["request_id"]: row for row in rows}
+        head = by_id[order[0]]
+        if (head["wait_s"] < self.config.fairness_wait_limit_seconds or
+                head["wait_s"] <= head["slo_s"]):
+            return order
+        horizon = frame["critical_horizon_seconds"]
+        urgent = []
+        for rid in order[slots:]:
+            row = by_id[rid]
+            slack = row["slo_s"] - row["wait_s"] - row["prediction_p90_s"]
+            if 0 <= slack < horizon:
+                urgent.append((slack, row["position"], rid))
+        if not urgent:
+            return order
+        selected = min(urgent)[2]
+        frame.update(critical_defer_action="bypass_planned",
+                     critical_defer_protected_id=order[0],
+                     critical_defer_selected_id=selected,
+                     critical_extra_bypass=self.deferred_protected is not None)
+        frame["_defer_protected_request"] = next(
+            r for r in frame["_candidates"] if r.request_id == order[0])
+        return ((selected,) + tuple(order[1:slots]) + (order[0],) +
+                tuple(i for i in order[slots:] if i != selected))
+
     def attempt(self, frame, request):
         if request.request_id in frame["_candidate_set"]:
             frame["window_attempts"].append(request.request_id)
@@ -644,6 +931,17 @@ class AdmissionController:
     def admitted(self, frame, request):
         key = "window_admitted" if request.request_id in frame["_candidate_set"] else "tail_admitted"
         frame[key].append(request.request_id)
+        if self.config.critical_defer_once:
+            if request is self.deferred_protected:
+                self.deferred_protected = None
+                frame["critical_defer_repaid"] = True
+            if (frame.get("_applied") and
+                    frame.get("critical_defer_action") == "bypass_planned" and
+                    request.request_id == frame.get("critical_defer_selected_id") and
+                    not frame.get("critical_defer_committed")):
+                self.extra_bypass_used = frame.get("critical_extra_bypass", False)
+                self.deferred_protected = frame["_defer_protected_request"]
+                frame["critical_defer_committed"] = True
         if (self.config.fairness_alternate and key == "window_admitted"
                 and frame.get("_applied") and frame.get("fairness_alternate_competing")):
             advanced = frame["_fairness_advanced"]
@@ -788,6 +1086,9 @@ class AdmissionController:
         frame["actual_admission_order"] = frame["window_admitted"] + frame["tail_admitted"]
         if self.config.fairness_alternate:
             frame["fairness_alternate_turn_after"] = self.fairness_next
+        if self.config.critical_defer_once:
+            frame["critical_defer_pending_after"] = (
+                self.deferred_protected.request_id if self.deferred_protected is not None else None)
         if self.config.head_policy == "type_slo":
             positions = {request_id: index for index, request_id in enumerate(frame["candidate_ids"])}
             admitted_positions = [positions[rid] for rid in frame["window_admitted"]]
