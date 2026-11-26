@@ -284,13 +284,20 @@ class AdmissionController:
                 or not config.critical_defer_once or config.mode != "apply"):
             raise ValueError("Delay order requires Critical C apply with fairness/defer and SHORT_HORIZON=0")
         self.group_policy = os.environ.get("VLLM_R1_GROUP_POLICY", "alternate")
-        if self.group_policy not in ("alternate", "feasible_first"):
+        self.bounded_group_policy = self.group_policy in ("fixed_k", "dynamic_k")
+        if self.group_policy not in ("alternate", "feasible_first") and not self.bounded_group_policy:
             raise ValueError("invalid VLLM_R1_GROUP_POLICY")
-        if self.group_policy == "feasible_first" and (
+        if self.group_policy != "alternate" and (
                 config.critical_variant != "C" or config.mode != "apply"
                 or not config.fairness_apply or not config.fairness_alternate
                 or self.short_enabled or self.delay_order_mode != "off"):
-            raise ValueError("feasible_first requires plain Critical C with fairness enabled")
+            raise ValueError("Group policy requires plain Critical C with fairness enabled")
+        self.feasible_streak = 0
+        if self.group_policy == "dynamic_k":
+            self.protection_target = float(os.environ.get("VLLM_R1_PROTECTION_TARGET_S", "45"))
+            if (not math.isfinite(self.protection_target) or
+                    self.protection_target <= config.fairness_wait_limit_seconds):
+                raise ValueError("Protection target must exceed the fairness wait limit")
         self.short_previous = None
         self.short_gaps = deque(maxlen=16)
         self.capacity_observe = os.environ.get("VLLM_R1_CAPACITY_OBSERVE", "0") == "1"
@@ -301,6 +308,7 @@ class AdmissionController:
                 self.short_gaps.append(timestamp - self.short_previous)
             self.short_previous = timestamp
         if not still_waiting:
+            self.feasible_streak = 0
             self.admission_intervals.clear()
             self.last_batch_time = self.interval_median = None
         elif admitted_new:
@@ -622,12 +630,13 @@ class AdmissionController:
                                 frame["critical_interval_count"] = len(self.admission_intervals)
                             branch, alternate, competing = alternate_fairness_order(
                                 rows, self.config.fairness_wait_limit_seconds, self.fairness_next,
-                                self.config.feasible_order, horizon, self.group_policy)
+                                self.config.feasible_order, horizon,
+                                "feasible_first" if self.bounded_group_policy else self.group_policy)
                             frame["feasible_order"] = self.config.feasible_order
                             frame["critical_horizon_seconds"] = horizon
                             frame["fairness_alternate_competing"] = competing
                             frame["fairness_alternate_turn_before"] = self.fairness_next
-                            if competing:
+                            if competing or self.bounded_group_policy:
                                 frame["_fairness_groups"] = {
                                     row["request_id"]: (
                                         "protected" if row["wait_s"] >= self.config.fairness_wait_limit_seconds
@@ -636,7 +645,10 @@ class AdmissionController:
                         else:
                             branch, alternate = observe_fairness_order(
                                 rows, self.config.fairness_wait_limit_seconds)
-                        if self.config.critical_defer_once:
+                        if self.bounded_group_policy and competing:
+                            branch = self.group_policy
+                            alternate = self.order_bounded_groups(frame, rows, alternate, horizon)
+                        if self.config.critical_defer_once and not self.bounded_group_policy:
                             alternate = self.plan_critical_deferral(frame, rows, alternate)
                         if self.short_enabled and self.config.critical_variant == "C":
                             alternate = self.short_horizon_order(frame, rows, alternate, branch, timestamp)
@@ -856,6 +868,35 @@ class AdmissionController:
             original_count=scores[head], selected_count=scores[best], samples=len(gaps))
         return (best,) + tuple(i for i in order if i != best) if best != head else order
 
+    def order_bounded_groups(self, frame, rows, order, horizon):
+        groups = frame["_fairness_groups"]
+        feasible = deque(rid for rid in order if groups[rid] == "feasible")
+        protected = deque(rid for rid in order if groups[rid] == "protected")
+        remaining = [rid for rid in order if groups[rid] is None]
+        waits = {row["request_id"]: row["wait_s"] for row in rows}
+        streak = self.feasible_streak
+        fixed = self.group_policy == "fixed_k"
+        if fixed:
+            frame["group_k_remaining"] = max(0, 4 - streak)
+        else:
+            frame["group_k_remaining"] = math.floor(
+                max(0, self.protection_target - waits[protected[0]]) / horizon)
+        frame["group_feasible_streak_before"] = streak
+        frame["_remaining_protected"] = len(protected)
+        planned = []
+        while feasible and protected:
+            if fixed:
+                serve_protected = streak >= 4
+            else:
+                serve_protected = waits[protected[0]] + horizon > self.protection_target
+            if serve_protected:
+                planned.append(protected.popleft())
+                streak = 0
+            else:
+                planned.append(feasible.popleft())
+                streak += 1
+        return tuple(planned) + tuple(protected) + tuple(feasible) + tuple(remaining)
+
     def plan_critical_deferral(self, frame, rows, order):
         """Reorder only the validated prefix; commit debt only upon admission."""
         pending = self.deferred_protected
@@ -942,6 +983,14 @@ class AdmissionController:
                 self.extra_bypass_used = frame.get("critical_extra_bypass", False)
                 self.deferred_protected = frame["_defer_protected_request"]
                 frame["critical_defer_committed"] = True
+        if self.bounded_group_policy and frame.get("_applied"):
+            group = frame.get("_fairness_groups", {}).get(request.request_id)
+            if group == "protected":
+                self.feasible_streak = 0
+                if "_remaining_protected" in frame:
+                    frame["_remaining_protected"] -= 1
+            elif group == "feasible" and frame.get("_remaining_protected", 0):
+                self.feasible_streak += 1
         if (self.config.fairness_alternate and key == "window_admitted"
                 and frame.get("_applied") and frame.get("fairness_alternate_competing")):
             advanced = frame["_fairness_advanced"]
